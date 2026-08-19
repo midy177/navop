@@ -2,6 +2,10 @@ use anyhow::Error;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use connection_form::credential::{
+    CredentialCapabilities, CredentialPickerConfig, CredentialPickerEvent,
+    CredentialReferencePicker, create_credential_picker, resolve_connection_for_runtime,
+};
 use connection_form::team::{
     TeamSelectItem, connection_sync_controls_visible_in, create_team_select, refresh_team_options,
     refresh_teams_tooltip, replace_team_options, resolve_team_assignment, selected_team_id,
@@ -15,7 +19,8 @@ use db::{
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AsyncApp, Axis, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement, PathPromptOptions, Render, SharedString, Styled, Window, div, prelude::*, px,
+    ParentElement, PathPromptOptions, Render, SharedString, Styled, Subscription, Window, div,
+    prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, Size,
@@ -1234,6 +1239,27 @@ fn missing_ssh_tunnel_required_field(
     None
 }
 
+fn credential_capabilities_for_fields(
+    config: &DbFormConfig,
+    username_field: &str,
+    password_field: &str,
+) -> CredentialCapabilities {
+    let has_field = |name: &str| {
+        config
+            .tab_groups
+            .iter()
+            .flat_map(|tab| tab.fields.iter())
+            .any(|field| field.name == name)
+    };
+
+    match (has_field(username_field), has_field(password_field)) {
+        (true, true) => CredentialCapabilities::login(),
+        (true, false) => CredentialCapabilities::username_only(),
+        (false, true) => CredentialCapabilities::password_only(),
+        (false, false) => CredentialCapabilities::default(),
+    }
+}
+
 /// Event emitted when a connection is saved successfully
 #[derive(Clone, Debug)]
 pub enum DbConnectionFormEvent {
@@ -1250,6 +1276,8 @@ pub struct DbConnectionForm {
     field_values: Vec<(String, Entity<String>)>,
     field_inputs: Vec<Option<Entity<InputState>>>,
     field_selects: std::collections::HashMap<String, Entity<SelectState<Vec<FormSelectItem>>>>,
+    credential_picker: Entity<CredentialReferencePicker>,
+    proxy_credential_picker: Entity<CredentialReferencePicker>,
     is_testing: Entity<bool>,
     test_result: Entity<Option<Result<bool, String>>>,
     workspace_select: Entity<SelectState<Vec<WorkspaceSelectItem>>>,
@@ -1264,6 +1292,7 @@ pub struct DbConnectionForm {
     /// Oracle client detection status: Ok(version) / Err(error).
     oracle_client_status: Entity<Option<Result<String, String>>>,
     oracle_client_checking: Entity<bool>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl DbConnectionForm {
@@ -1401,7 +1430,31 @@ impl DbConnectionForm {
         let sync_enabled = cx.new(|_| true);
         let oracle_client_status = cx.new(|_| None);
         let oracle_client_checking = cx.new(|_| false);
-
+        let credential_picker = create_credential_picker(
+            CredentialPickerConfig::new(
+                "database-credential",
+                credential_capabilities_for_fields(&config, "username", "password"),
+            ),
+            window,
+            cx,
+        );
+        let proxy_credential_picker = create_credential_picker(
+            CredentialPickerConfig::new(
+                "database-proxy-credential",
+                credential_capabilities_for_fields(&config, "proxy_username", "proxy_password"),
+            ),
+            window,
+            cx,
+        );
+        let subscriptions = vec![
+            cx.subscribe(&credential_picker, |_, _, _: &CredentialPickerEvent, cx| {
+                cx.notify()
+            }),
+            cx.subscribe(
+                &proxy_credential_picker,
+                |_, _, _: &CredentialPickerEvent, cx| cx.notify(),
+            ),
+        ];
         let form = Self {
             config,
             current_db_type,
@@ -1410,6 +1463,8 @@ impl DbConnectionForm {
             field_values,
             field_inputs,
             field_selects,
+            credential_picker,
+            proxy_credential_picker,
             is_testing,
             test_result,
             workspace_select,
@@ -1422,6 +1477,7 @@ impl DbConnectionForm {
             sync_enabled,
             oracle_client_status,
             oracle_client_checking,
+            _subscriptions: subscriptions,
         };
 
         form.refresh_oracle_client_status(cx);
@@ -1570,6 +1626,19 @@ impl DbConnectionForm {
         });
 
         if let Ok(params) = connection.to_db_connection() {
+            self.credential_picker.update(cx, |picker, cx| {
+                picker.set_reference(params.credential_reference.clone(), window, cx)
+            });
+            self.proxy_credential_picker.update(cx, |picker, cx| {
+                picker.set_reference(
+                    params
+                        .proxy
+                        .as_ref()
+                        .and_then(|proxy| proxy.credential_reference.clone()),
+                    window,
+                    cx,
+                )
+            });
             self.selected_ssh_connection_id = params
                 .extra_params
                 .get("ssh_connection_id")
@@ -1752,6 +1821,7 @@ impl DbConnectionForm {
             workspace_id,
             proxy: self.proxy_config(cx).ok().flatten(),
             extra_params,
+            credential_reference: self.credential_picker.read(cx).selected_reference(),
         }
     }
 
@@ -1811,6 +1881,7 @@ impl DbConnectionForm {
             &self
                 .get_field_value("proxy_password", cx)
                 .unwrap_or_default(),
+            self.proxy_credential_picker.read(cx).selected_reference(),
         )
     }
 
@@ -1921,19 +1992,20 @@ impl DbConnectionForm {
             return;
         }
 
-        let connection = match self.build_connection_with_referenced_ssh(cx) {
-            Ok(mut connection) => {
-                if let Some(ssh_connection) = self.resolve_referenced_ssh_connection(cx) {
-                    if let Err(error) = connection.apply_referenced_ssh_tunnel(ssh_connection) {
-                        self.test_result.update(cx, |result, cx| {
-                            *result = Some(Err(error.to_string()));
-                            cx.notify();
-                        });
-                        return;
-                    }
-                }
+        let connection = match self
+            .build_connection_with_referenced_ssh(cx)
+            .and_then(|connection| {
+                resolve_connection_for_runtime(
+                    StoredConnection::new_database(connection.name.clone(), connection, None),
+                    cx,
+                )
+            })
+            .and_then(|connection| {
                 connection
-            }
+                    .to_db_connection()
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok(connection) => connection,
             Err(error) => {
                 self.test_result.update(cx, |result, cx| {
                     *result = Some(Err(error));
@@ -2206,6 +2278,19 @@ impl DbConnectionForm {
             .unwrap_or(false)
     }
 
+    fn render_credential_picker_field(&self, proxy: bool) -> gpui_component::form::Field {
+        let picker = if proxy {
+            self.proxy_credential_picker.clone()
+        } else {
+            self.credential_picker.clone()
+        };
+        field()
+            .label("钥匙串")
+            .items_center()
+            .label_justify_end()
+            .child(div().w_full().child(picker))
+    }
+
     fn set_bool_field_value(
         &mut self,
         field_name: &str,
@@ -2354,7 +2439,22 @@ impl DbConnectionForm {
         let visible_fields = current_tab_fields
             .iter()
             .enumerate()
-            .filter(|(_, field)| self.is_field_visible(field, cx))
+            .filter(|(_, field)| {
+                self.is_field_visible(field, cx)
+                    && match field.name.as_str() {
+                        "username" | "password" => self
+                            .credential_picker
+                            .read(cx)
+                            .selected_reference()
+                            .is_none(),
+                        "proxy_username" | "proxy_password" => self
+                            .proxy_credential_picker
+                            .read(cx)
+                            .selected_reference()
+                            .is_none(),
+                        _ => true,
+                    }
+            })
             .collect::<Vec<_>>();
 
         if visible_fields.is_empty() {
@@ -2370,12 +2470,25 @@ impl DbConnectionForm {
 
         let is_general_tab = self.active_tab == 0;
         let db_type = self.config.db_type.clone();
+        let has_main_credentials = current_tab_fields
+            .iter()
+            .any(|field| matches!(field.name.as_str(), "username" | "password"));
+        let has_proxy_credentials = self.field_bool_value("proxy_enabled", cx)
+            && current_tab_fields
+                .iter()
+                .any(|field| matches!(field.name.as_str(), "proxy_username" | "proxy_password"));
 
         v_form()
             .layout(Axis::Horizontal)
             .with_size(Size::Medium)
             .columns(1)
             .label_width(px(100.))
+            .when(has_main_credentials, |form| {
+                form.child(self.render_credential_picker_field(false))
+            })
+            .when(has_proxy_credentials, |form| {
+                form.child(self.render_credential_picker_field(true))
+            })
             .children(visible_fields.into_iter().map(|(i, field_info)| {
                 let input_idx = field_input_offset + i;
                 let is_sqlite_path = matches!(db_type, DatabaseType::SQLite | DatabaseType::DuckDB)
@@ -2543,7 +2656,7 @@ impl DbConnectionForm {
                                             .overflow_hidden()
                                             .text_ellipsis()
                                             .whitespace_nowrap()
-                                            .flex_shrink(1.0)
+                                            .flex_shrink_1()
                                             .min_w_0()
                                             .when(is_checking, |div| {
                                                 div.text_color(cx.theme().muted_foreground).child(
@@ -2553,7 +2666,7 @@ impl DbConnectionForm {
                                             })
                                             .when(!is_checking, |div| match &oracle_client_status {
                                                 Some(Ok(version)) => div
-                                                    .text_color(cx.theme().success_foreground)
+                                                    .text_color(cx.theme().primary_foreground)
                                                     .child(
                                                         t!(
                                                             "ConnectionForm.oracle_client_available",
@@ -2973,6 +3086,7 @@ mod tests {
     use super::*;
     use db::plugin_manifest::FormValueCondition;
     use gpui::{TestAppContext, VisualTestContext, WindowOptions};
+    use one_core::settings::AppSettings;
     use one_core::storage::{SshAuthMethod, SshParams};
 
     fn field_names(tab_group: &TabGroup) -> Vec<&str> {
@@ -3013,6 +3127,12 @@ mod tests {
                 port: 22,
                 username: "root".to_string(),
                 auth_method: SshAuthMethod::Agent,
+                credential_reference: None,
+                prompt_username: None,
+                prompt_password: None,
+                keyboard_interactive: None,
+                terminal_encoding: Default::default(),
+                terminal_type: Default::default(),
                 connect_timeout: None,
                 keepalive_interval: None,
                 keepalive_max: None,
@@ -3025,6 +3145,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         );
@@ -3054,6 +3175,7 @@ mod tests {
             port: 3306,
             username: "app".to_string(),
             password: String::new(),
+            credential_reference: None,
             database: None,
             service_name: None,
             sid: None,
@@ -3095,7 +3217,10 @@ mod tests {
 
     #[gpui::test]
     fn ssh_selection_uses_confirmed_event_value(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            cx.set_global(AppSettings::default());
+            gpui_component::init(cx);
+        });
         let window = cx.update(|cx| {
             cx.open_window(WindowOptions::default(), |window, cx| {
                 cx.new(|cx| DbConnectionForm::new(DbFormConfig::mysql(), window, cx))

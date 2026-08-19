@@ -17,6 +17,7 @@ use alacritty_terminal::term::{RenderableContent, Term, TermDamage};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui::*;
 use one_core::settings::default_grid_font_fallback_families;
+use palette::IntoColor;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -135,7 +136,7 @@ impl FontVariants {
 
 #[inline]
 fn terminal_bold_weight(background: Hsla) -> FontWeight {
-    if background.l >= 0.5 {
+    if background.lightness >= 0.5 {
         FontWeight::SEMIBOLD
     } else {
         FontWeight::BOLD
@@ -976,7 +977,7 @@ impl RenderCache {
 
             // DIM 标志：降低前景色透明度
             if cell.flags.contains(Flags::DIM) {
-                fg.a *= 0.7;
+                fg.alpha *= 0.7;
             }
 
             if !cell.is_selected && cell.flags.contains(Flags::INVERSE) {
@@ -1462,6 +1463,7 @@ impl Element for TerminalElementImpl {
                         background_color: None,
                         underline,
                         strikethrough: None,
+                        letter_spacing: None,
                     }],
                     Some(tb.cell_width * run.cell_width_cols as f32),
                 );
@@ -1529,6 +1531,7 @@ impl Element for TerminalElementImpl {
                                         background_color: None,
                                         underline: None,
                                         strikethrough: None,
+                                        letter_spacing: None,
                                     }],
                                     Some(block_bounds.size.width),
                                 );
@@ -1590,10 +1593,10 @@ impl Element for TerminalElementImpl {
 /// 快速颜色比较 - 使用位比较代替浮点比较
 #[inline]
 fn hsla_eq(a: Hsla, b: Hsla) -> bool {
-    a.h.to_bits() == b.h.to_bits()
-        && a.s.to_bits() == b.s.to_bits()
-        && a.l.to_bits() == b.l.to_bits()
-        && a.a.to_bits() == b.a.to_bits()
+    a.hue.into_degrees().to_bits() == b.hue.into_degrees().to_bits()
+        && a.saturation.to_bits() == b.saturation.to_bits()
+        && a.lightness.to_bits() == b.lightness.to_bits()
+        && a.alpha.to_bits() == b.alpha.to_bits()
 }
 
 fn colors_equal(a: &Colors, b: &Colors) -> bool {
@@ -1618,13 +1621,13 @@ fn terminal_underline_flags(flags: Flags) -> bool {
 
 #[inline]
 fn rgb_to_hsla(rgb: Rgb) -> Hsla {
-    Rgba {
-        r: rgb.r as f32 / 255.0,
-        g: rgb.g as f32 / 255.0,
-        b: rgb.b as f32 / 255.0,
-        a: 1.0,
-    }
-    .into()
+    Rgba::new(
+        rgb.r as f32 / 255.0,
+        rgb.g as f32 / 255.0,
+        rgb.b as f32 / 255.0,
+        1.0,
+    )
+    .into_color()
 }
 
 fn convert_color(color: Color, colors: &Colors) -> Hsla {
@@ -1658,10 +1661,10 @@ fn linearize(value: f32) -> f32 {
 
 /// 计算相对亮度 (WCAG 定义)
 fn relative_luminance(color: Hsla) -> f32 {
-    let rgba: Rgba = color.into();
-    let r = linearize(rgba.r);
-    let g = linearize(rgba.g);
-    let b = linearize(rgba.b);
+    let rgba: Rgba = color.into_color();
+    let r = linearize(rgba.red);
+    let g = linearize(rgba.green);
+    let b = linearize(rgba.blue);
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
@@ -1692,18 +1695,18 @@ fn ensure_minimum_contrast(fg: Hsla, bg: Hsla) -> Hsla {
     // 尝试调整亮度以达到最小对比度
     if bg_lum > 0.5 {
         // 亮背景 -> 降低前景亮度
-        adjusted.l = (adjusted.l - 0.2).max(0.0);
+        adjusted.lightness = (adjusted.lightness - 0.2).max(0.0);
     } else {
         // 暗背景 -> 提高前景亮度
-        adjusted.l = (adjusted.l + 0.2).min(1.0);
+        adjusted.lightness = (adjusted.lightness + 0.2).min(1.0);
     }
 
     // 如果仍然不够，进一步调整
     if contrast_ratio(adjusted, bg) < MIN_CONTRAST_RATIO {
         if bg_lum > 0.5 {
-            adjusted.l = 0.0; // 纯黑
+            adjusted.lightness = 0.0; // 纯黑
         } else {
-            adjusted.l = 1.0; // 纯白
+            adjusted.lightness = 1.0; // 纯白
         }
     }
 
@@ -1733,7 +1736,7 @@ fn named_color_to_hsla(color: NamedColor) -> Hsla {
         NamedColor::Cursor => return hsla(0.0, 0.0, 1.0, 0.8),
         _ => (0.83, 0.83, 0.83),
     };
-    Rgba { r, g, b, a: 1.0 }.into()
+    Rgba::new(r, g, b, 1.0).into_color()
 }
 
 fn indexed_color_to_hsla(idx: u8) -> Hsla {
@@ -1772,23 +1775,11 @@ fn indexed_color_to_hsla(idx: u8) -> Hsla {
                     (55.0 + v as f32 * 40.0) / 255.0
                 }
             };
-            Rgba {
-                r: to_component(r),
-                g: to_component(g),
-                b: to_component(b),
-                a: 1.0,
-            }
-            .into()
+            Rgba::new(to_component(r), to_component(g), to_component(b), 1.0).into_color()
         }
         232..=255 => {
             let shade = (8.0 + (idx - 232) as f32 * 10.0) / 255.0;
-            Rgba {
-                r: shade,
-                g: shade,
-                b: shade,
-                a: 1.0,
-            }
-            .into()
+            Rgba::new(shade, shade, shade, 1.0).into_color()
         }
     }
 }
@@ -1796,14 +1787,86 @@ fn indexed_color_to_hsla(idx: u8) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockRect, CellData, RenderCache, TextRunFontRole, block_cursor_glyph_from_cell,
-        block_element_geometry, ensure_minimum_contrast, terminal_bold_weight,
-        terminal_text_font_role,
+        AddonManager, BlockRect, CellData, RenderCache, TextRunFontRole,
+        block_cursor_glyph_from_cell, block_element_geometry, ensure_minimum_contrast,
+        terminal_bold_weight, terminal_text_font_role,
     };
+    use crate::theme::TerminalTheme;
+    use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::term::cell::{Cell, Flags};
     use alacritty_terminal::term::color::Colors;
-    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    use alacritty_terminal::term::{Config as TermConfig, Term};
+    use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler};
     use gpui::{FontWeight, rgb};
+    use palette::IntoColor as _;
+    use terminal::pty_backend::GpuiEventProxy;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    struct TestTermDimensions {
+        columns: usize,
+        screen_lines: usize,
+    }
+
+    impl Dimensions for TestTermDimensions {
+        fn total_lines(&self) -> usize {
+            self.screen_lines
+        }
+
+        fn screen_lines(&self) -> usize {
+            self.screen_lines
+        }
+
+        fn columns(&self) -> usize {
+            self.columns
+        }
+    }
+
+    fn cached_screen_rows(cache: &RenderCache) -> Vec<String> {
+        cache
+            .lines
+            .iter()
+            .map(|line| {
+                let mut row = vec![' '; cache.num_cols];
+                for run in &line.text_runs {
+                    let mut column = run.start_col;
+                    for character in run.text.chars() {
+                        if column < row.len() {
+                            row[column] = character;
+                        }
+                        column += run.cell_width_cols;
+                    }
+                    assert_eq!(run.start_col + run.column_count, column);
+                }
+                row.into_iter().collect()
+            })
+            .collect()
+    }
+
+    fn renderable_screen_rows(term: &Term<GpuiEventProxy>) -> Vec<String> {
+        let columns = term.columns();
+        let screen_lines = term.screen_lines();
+        let content = term.renderable_content();
+        let display_offset = content.display_offset;
+        let mut rows = vec![vec![' '; columns]; screen_lines];
+
+        for cell in content.display_iter {
+            let screen_line = cell.point.line.0 + display_offset as i32;
+            let Ok(row) = usize::try_from(screen_line) else {
+                continue;
+            };
+            if row >= screen_lines || cell.point.column.0 >= columns {
+                continue;
+            }
+            if cell.c == '\0' || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            rows[row][cell.point.column.0] = cell.c;
+        }
+
+        rows.into_iter()
+            .map(|row| row.into_iter().collect())
+            .collect()
+    }
 
     fn approx_eq(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5
@@ -1827,6 +1890,56 @@ mod tests {
             bg: Color::Named(NamedColor::Background),
             flags,
             is_selected: false,
+        }
+    }
+
+    #[test]
+    fn incremental_cache_preserves_chunked_soft_wrapped_output() {
+        let dimensions = TestTermDimensions {
+            columns: 16,
+            screen_lines: 6,
+        };
+        let (event_tx, _event_rx) = unbounded_channel();
+        let mut term = Term::new(
+            TermConfig::default(),
+            &dimensions,
+            GpuiEventProxy::new(event_tx),
+        );
+        let mut processor: Processor<StdSyncHandler> = Processor::new();
+        let addon_manager = AddonManager::new();
+        let theme = TerminalTheme::midnight();
+        let mut cache =
+            RenderCache::new(term.screen_lines(), term.columns(), term.colors().clone());
+        let chunks: &[&[u8]] = &[
+            b"portmap: [v1] ",
+            b"UPnP reply Locat",
+            b"ion:http://172.",
+            b"16.0.1:1900/igd",
+            b".xml Server:vxWo",
+            b"rks/5.5\r\n* UDP: true",
+        ];
+
+        for chunk in chunks {
+            processor.advance(&mut term, chunk);
+            cache.update(&mut term, &addon_manager, &theme, None);
+
+            let mut rebuilt =
+                RenderCache::new(term.screen_lines(), term.columns(), term.colors().clone());
+            rebuilt.rebuild_all(&term, None);
+            let actual = cached_screen_rows(&cache);
+
+            assert_eq!(
+                renderable_screen_rows(&term),
+                actual,
+                "incremental cache diverged after chunk {:?}",
+                String::from_utf8_lossy(chunk)
+            );
+            assert_eq!(
+                cached_screen_rows(&rebuilt),
+                actual,
+                "incremental cache diverged from a full rebuild after chunk {:?}",
+                String::from_utf8_lossy(chunk)
+            );
         }
     }
 
@@ -1896,8 +2009,8 @@ mod tests {
     #[test]
     fn selected_cells_use_terminal_theme_selection_colors() {
         let mut cache = RenderCache::new(1, 8, Colors::default());
-        cache.custom_foreground = rgb(0x100F0F).into();
-        cache.custom_selection = rgb(0xE6E4D9).into();
+        cache.custom_foreground = rgb(0x100F0F).into_color();
+        cache.custom_selection = rgb(0xE6E4D9).into_color();
         let mut cell = plain_cell(0, 'Q', Flags::empty());
         cell.is_selected = true;
 
@@ -1925,9 +2038,12 @@ mod tests {
     fn light_terminal_uses_semibold_for_ansi_bold_text() {
         assert_eq!(
             FontWeight::SEMIBOLD,
-            terminal_bold_weight(rgb(0xFAFAFA).into())
+            terminal_bold_weight(rgb(0xFAFAFA).into_color())
         );
-        assert_eq!(FontWeight::BOLD, terminal_bold_weight(rgb(0x171717).into()));
+        assert_eq!(
+            FontWeight::BOLD,
+            terminal_bold_weight(rgb(0x171717).into_color())
+        );
     }
 
     #[test]

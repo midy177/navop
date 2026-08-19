@@ -1,21 +1,27 @@
-use crate::home_tab::HomePage;
+use crate::credential_vault::CredentialVaultView;
+use crate::home_tab::{HomePage, resolve_connection_credentials};
 use crate::license::is_feature_enabled;
-use crate::onetcli_app::GlobalTabContainer;
+use crate::onetcli_app::{GlobalOnetCliApp, GlobalTabContainer};
+use crate::session_logs::SessionLogsPage;
 use crate::setting_tab::{AppSettings, DatabaseOpenMode, SettingsPanel};
+#[cfg(feature = "api-testing")]
+use api_tools::ApiTestView;
 use db_view::database_tab::DatabaseTabView;
-use gpui::{App, AppContext, Context, Entity, Window};
+use gpui::{App, AppContext, Context, Entity, Focusable, Window};
 use gpui_component::{WindowExt, notification::Notification};
+use json_view::JsonFormatterView;
 use mongodb_view::MongoTabView;
 use notes::NotesView;
 use one_core::license::Feature;
 use one_core::settings::{LocalTerminalCustomProfile, LocalTerminalProfileKind};
-use one_core::storage::{ConnectionType, ProxyConfig, ProxyType, StoredConnection, Workspace};
+use one_core::storage::{ConnectionType, StoredConnection, Workspace};
 use one_core::tab_container::{TabContainer, TabItem, TabOpenMode};
 use redis_view::RedisTabView;
 use remote_desktop::{RemoteDesktopConnectionOptions, RemoteDesktopProtocol};
 use remote_desktop_view::{RemoteDesktopView, RemoteDesktopViewConfig};
 use rust_i18n::t;
 use sftp_view::{SftpView, SftpViewEvent};
+use std::collections::HashSet;
 use terminal::{
     local_config_from_custom_profile, local_config_from_settings,
     local_config_from_settings_with_profile,
@@ -52,11 +58,69 @@ fn redis_tab_open_context(
     }
 }
 
+fn database_tab_connection_context(
+    open_mode: DatabaseOpenMode,
+    active_connection: &StoredConnection,
+    workspace_id: Option<i64>,
+    all_connections: &[StoredConnection],
+    mut resolve: impl FnMut(&StoredConnection) -> Option<StoredConnection>,
+) -> Option<(StoredConnection, Vec<StoredConnection>)> {
+    let active_connection_id = active_connection.id;
+    let active_connection = resolve(active_connection)?;
+    let connections = match (open_mode, workspace_id) {
+        (DatabaseOpenMode::Workspace, Some(workspace_id)) => {
+            let mut connections = Vec::new();
+            let mut active_connection_included = false;
+            let mut seen_connection_ids = HashSet::new();
+
+            for candidate in all_connections
+                .iter()
+                .filter(|candidate| candidate.workspace_id == Some(workspace_id))
+                .filter(|candidate| candidate.connection_type == ConnectionType::Database)
+            {
+                // Workspace connections come from persistent storage and should have stable IDs.
+                // Treating multiple `None` IDs as equal would incorrectly duplicate the active
+                // runtime connection and could leak an unresolved candidate into the tab.
+                let Some(candidate_id) = candidate.id else {
+                    continue;
+                };
+
+                if active_connection_id == Some(candidate_id) {
+                    if !active_connection_included {
+                        seen_connection_ids.insert(candidate_id);
+                        connections.push(active_connection.clone());
+                        active_connection_included = true;
+                    }
+                    continue;
+                }
+
+                if seen_connection_ids.contains(&candidate_id) {
+                    continue;
+                }
+
+                if let Some(connection) = resolve(candidate) {
+                    seen_connection_ids.insert(candidate_id);
+                    connections.push(connection);
+                }
+            }
+
+            if !active_connection_included {
+                connections.push(active_connection.clone());
+            }
+            connections
+        }
+        _ => vec![active_connection.clone()],
+    };
+
+    Some((active_connection, connections))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use one_core::storage::{
-        ProxyConfig, ProxyType, RedisMode, RedisParams, RemoteDesktopParams,
+        DatabaseType, DbConnectionConfig, ProxyConfig, ProxyType, RedisMode, RedisParams,
+        RemoteDesktopBackendPreference, RemoteDesktopParams,
         RemoteDesktopProtocol as StoredRemoteDesktopProtocol,
     };
 
@@ -66,6 +130,7 @@ mod tests {
             port: 6379,
             password: None,
             username: None,
+            credential_reference: None,
             db_index: 0,
             mode: RedisMode::Standalone,
             use_tls: false,
@@ -83,6 +148,220 @@ mod tests {
         let mut workspace = Workspace::new(name.to_string());
         workspace.id = Some(id);
         workspace
+    }
+
+    fn database_connection(
+        id: Option<i64>,
+        name: &str,
+        workspace_id: Option<i64>,
+    ) -> StoredConnection {
+        let mut connection = StoredConnection::new_database(
+            name.to_string(),
+            DbConnectionConfig {
+                id: String::new(),
+                database_type: DatabaseType::MySQL,
+                name: name.to_string(),
+                host: "localhost".to_string(),
+                port: 3306,
+                username: "stored-user".to_string(),
+                password: "stored-password".to_string(),
+                credential_reference: None,
+                database: None,
+                service_name: None,
+                sid: None,
+                workspace_id,
+                proxy: None,
+                extra_params: Default::default(),
+            },
+            workspace_id,
+        );
+        connection.id = id;
+        connection
+    }
+
+    #[test]
+    fn database_single_mode_resolves_the_active_connection() {
+        let active = database_connection(Some(1), "active", Some(7));
+        let mut resolved_ids = Vec::new();
+
+        let (resolved_active, connections) = database_tab_connection_context(
+            DatabaseOpenMode::Single,
+            &active,
+            Some(7),
+            &[active.clone()],
+            |connection| {
+                resolved_ids.push(connection.id);
+                let mut connection = connection.clone();
+                connection.name = format!("resolved-{}", connection.name);
+                Some(connection)
+            },
+        )
+        .expect("active connection should resolve");
+
+        assert_eq!(vec![Some(1)], resolved_ids);
+        assert_eq!("resolved-active", resolved_active.name);
+        assert_eq!(vec!["resolved-active"], connection_names(&connections));
+    }
+
+    #[test]
+    fn database_workspace_mode_resolves_active_once_and_skips_failed_or_duplicate_peers() {
+        let active = database_connection(Some(1), "active", Some(7));
+        let failed_peer = database_connection(Some(2), "failed-peer", Some(7));
+        let peer = database_connection(Some(3), "peer", Some(7));
+        let duplicate_peer = database_connection(Some(3), "duplicate-peer", Some(7));
+        let all_connections = vec![
+            active.clone(),
+            active.clone(),
+            failed_peer,
+            peer,
+            duplicate_peer,
+        ];
+        let mut resolved_ids = Vec::new();
+
+        let (resolved_active, connections) = database_tab_connection_context(
+            DatabaseOpenMode::Workspace,
+            &active,
+            Some(7),
+            &all_connections,
+            |connection| {
+                resolved_ids.push(connection.id);
+                if connection.id == Some(2) {
+                    return None;
+                }
+                let mut connection = connection.clone();
+                connection.name = format!("resolved-{}", connection.name);
+                Some(connection)
+            },
+        )
+        .expect("active connection should resolve");
+
+        assert_eq!(vec![Some(1), Some(2), Some(3)], resolved_ids);
+        assert_eq!("resolved-active", resolved_active.name);
+        assert_eq!(
+            vec![Some(1), Some(3)],
+            connections
+                .iter()
+                .map(|connection| connection.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec!["resolved-active", "resolved-peer"],
+            connection_names(&connections)
+        );
+    }
+
+    #[test]
+    fn database_workspace_mode_does_not_treat_none_ids_as_the_active_connection() {
+        let active = database_connection(None, "active", Some(7));
+        let anonymous_peer = database_connection(None, "anonymous-peer", Some(7));
+        let persisted_peer = database_connection(Some(2), "persisted-peer", Some(7));
+        let all_connections = vec![anonymous_peer, persisted_peer];
+        let mut resolved_names = Vec::new();
+
+        let (resolved_active, connections) = database_tab_connection_context(
+            DatabaseOpenMode::Workspace,
+            &active,
+            Some(7),
+            &all_connections,
+            |connection| {
+                resolved_names.push(connection.name.clone());
+                let mut connection = connection.clone();
+                connection.name = format!("resolved-{}", connection.name);
+                Some(connection)
+            },
+        )
+        .expect("active connection should resolve");
+
+        assert_eq!("resolved-active", resolved_active.name);
+        assert_eq!(
+            vec![Some(2), None],
+            connections
+                .iter()
+                .map(|connection| connection.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec!["resolved-persisted-peer", "resolved-active"],
+            connection_names(&connections)
+        );
+        assert_eq!(vec!["active", "persisted-peer"], resolved_names);
+    }
+
+    #[test]
+    fn database_workspace_mode_without_workspace_id_uses_only_the_resolved_active_connection() {
+        let active = database_connection(Some(1), "active", None);
+        let peer = database_connection(Some(2), "peer", Some(7));
+        let mut resolved_ids = Vec::new();
+
+        let (resolved_active, connections) = database_tab_connection_context(
+            DatabaseOpenMode::Workspace,
+            &active,
+            None,
+            &[peer],
+            |connection| {
+                resolved_ids.push(connection.id);
+                let mut connection = connection.clone();
+                connection.name = format!("resolved-{}", connection.name);
+                Some(connection)
+            },
+        )
+        .expect("active connection should resolve");
+
+        assert_eq!(vec![Some(1)], resolved_ids);
+        assert_eq!("resolved-active", resolved_active.name);
+        assert_eq!(vec!["resolved-active"], connection_names(&connections));
+    }
+
+    #[test]
+    fn database_workspace_mode_filters_other_workspaces_and_connection_types() {
+        let active = database_connection(Some(1), "active", Some(7));
+        let peer = database_connection(Some(2), "peer", Some(7));
+        let other_workspace = database_connection(Some(3), "other-workspace", Some(8));
+        let redis = redis_connection(4, "redis", Some(7));
+        let mut resolved_ids = Vec::new();
+
+        let (_, connections) = database_tab_connection_context(
+            DatabaseOpenMode::Workspace,
+            &active,
+            Some(7),
+            &[active.clone(), peer, other_workspace, redis],
+            |connection| {
+                resolved_ids.push(connection.id);
+                Some(connection.clone())
+            },
+        )
+        .expect("active connection should resolve");
+
+        assert_eq!(vec![Some(1), Some(2)], resolved_ids);
+        assert_eq!(
+            vec![Some(1), Some(2)],
+            connections
+                .iter()
+                .map(|connection| connection.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn database_tab_open_fails_closed_when_active_resolution_fails() {
+        let active = database_connection(Some(1), "active", Some(7));
+
+        let context = database_tab_connection_context(
+            DatabaseOpenMode::Workspace,
+            &active,
+            Some(7),
+            &[active.clone()],
+            |_| None,
+        );
+
+        assert!(context.is_none());
+    }
+
+    fn connection_names(connections: &[StoredConnection]) -> Vec<&str> {
+        connections
+            .iter()
+            .map(|connection| connection.name.as_str())
+            .collect()
     }
 
     #[test]
@@ -114,33 +393,224 @@ mod tests {
     }
 
     #[test]
-    fn notes_sidebar_entry_precedes_extensions() {
+    fn session_logs_open_from_both_home_sidebars_as_a_stable_tab() {
+        let tabs_source = include_str!("home_tabs.rs").replace("\r\n", "\n");
+        let legacy_source = include_str!("../home_tab/sidebar_navigation.rs");
+        let persistent_source =
+            include_str!("../persistent_connection_sidebar/navigation_sections.rs");
+        let navigation_source = include_str!("../home_tab/navigation.rs");
+
+        assert!(tabs_source.contains("fn add_session_logs_tab"));
+        assert!(
+            tabs_source.contains("activate_or_add_tab_lazy(\n                    \"session-logs\"")
+        );
+        assert!(tabs_source.contains("TabItem::new(\"session-logs\", \"home\", page)"));
+        assert!(tabs_source.contains("window.defer(cx, move |window, cx|"));
+        assert!(legacy_source.contains("\"legacy-open-session-logs\""));
+        assert!(
+            legacy_source.contains("home.activate_navigation_application(application, window, cx)")
+        );
+        assert!(persistent_source.contains("\"persistent-open-session-logs\""));
+        assert!(
+            persistent_source
+                .contains("home.activate_navigation_application(application, window, cx)")
+        );
+        assert!(navigation_source.contains(
+            "NavigationApplication::SessionLogs => self.add_session_logs_tab(window, cx)"
+        ));
+    }
+
+    #[test]
+    fn credential_vault_opens_from_both_home_sidebars_as_a_stable_tab() {
+        let tabs_source = include_str!("home_tabs.rs").replace("\r\n", "\n");
+        let toolbar_source = include_str!("../home_tab/toolbar.rs");
+        let legacy_sidebar_source = include_str!("../home_tab/sidebar_navigation.rs");
+        let persistent_sidebar_source =
+            include_str!("../persistent_connection_sidebar/navigation_sections.rs");
+        let navigation_source = include_str!("../home_tab/navigation.rs");
+        let modern_home_source = include_str!("../home_tab/modern_home.rs");
+        let settings_source = include_str!("../setting_tab.rs");
+        let actions_source = include_str!("../credential_vault/actions.rs");
+
+        assert!(tabs_source.contains("fn add_credential_vault_tab"));
+        assert!(
+            tabs_source
+                .contains("activate_or_add_tab_lazy(\n                    \"credential-vault\"")
+        );
+        assert!(tabs_source.contains("TabItem::new(\"credential-vault\", \"home\", vault)"));
+        assert!(legacy_sidebar_source.contains("\"legacy-open-credential-vault\""));
+        assert!(
+            legacy_sidebar_source
+                .contains("home.activate_navigation_application(application, window, cx)")
+        );
+        assert!(persistent_sidebar_source.contains("\"persistent-open-credential-vault\""));
+        assert!(
+            persistent_sidebar_source
+                .contains("home.activate_navigation_application(application, window, cx)")
+        );
+        assert!(navigation_source.contains("NavigationApplication::CredentialVault =>"));
+        assert!(navigation_source.contains("self.add_credential_vault_tab(window, cx)"));
+        assert!(!modern_home_source.contains("\"modern-home-credential-vault\""));
+        assert!(!toolbar_source.contains("\"credential-vault-button\""));
+        assert!(!toolbar_source.contains("add_credential_vault_tab"));
+        assert!(!settings_source.contains("SettingPage::new(\"钥匙串\")"));
+        assert!(actions_source.contains("open_popup_window("));
+        assert!(!actions_source.contains("open_dialog("));
+    }
+
+    #[test]
+    fn persistent_sidebar_places_credential_vault_between_notes_and_extensions() {
+        use crate::navigation_quick_open::{
+            NavigationApplication, overflow_navigation_applications,
+        };
+
+        assert_eq!(
+            overflow_navigation_applications(),
+            vec![
+                NavigationApplication::SessionLogs,
+                NavigationApplication::CredentialVault,
+                NavigationApplication::Extensions,
+            ]
+        );
+    }
+
+    #[test]
+    fn both_home_sidebars_place_credential_vault_with_workspace_tools() {
+        let legacy_source = include_str!("../home_tab/sidebar_navigation.rs");
+        let persistent_source =
+            include_str!("../persistent_connection_sidebar/navigation_sections.rs");
+
+        for id in [
+            "\"legacy-open-notes\"",
+            "\"legacy-open-session-logs\"",
+            "\"legacy-open-credential-vault\"",
+            "\"legacy-open-extensions\"",
+        ] {
+            assert!(legacy_source.contains(id));
+        }
+        for id in [
+            "\"persistent-open-notes\"",
+            "\"persistent-open-session-logs\"",
+            "\"persistent-open-credential-vault\"",
+            "\"persistent-open-extensions\"",
+        ] {
+            assert!(persistent_source.contains(id));
+        }
+        assert!(legacy_source.contains("show_application_navigation_quick_open"));
+        assert!(persistent_source.contains("show_application_navigation_quick_open"));
+    }
+
+    #[test]
+    fn persistent_sidebar_home_entry_is_the_first_primary_navigation_item() {
         let source = include_str!("../persistent_connection_sidebar/rail.rs");
-        let notes = source.find("\"persistent-open-notes\"").unwrap();
-        let extensions = source.find("\"persistent-open-extensions\"").unwrap();
-        assert!(notes < extensions);
+        let home = source.find("\"persistent-open-home\"").unwrap();
+        let filters = source.find("render_filter_buttons(").unwrap();
+
+        assert!(home < filters);
+        assert!(source.contains("IconName::Home"));
+        assert!(source.contains("HomePage::show_home(home, window, cx)"));
+    }
+
+    #[test]
+    fn persistent_sidebar_home_entry_avoids_reentrant_home_page_updates() {
+        let tabs_source = include_str!("home_tabs.rs").replace("\r\n", "\n");
+        let tabs_impl = tabs_source.split_once("\nimpl HomePage {\n").unwrap().1;
+        let rail_source =
+            include_str!("../persistent_connection_sidebar/rail.rs").replace("\r\n", "\n");
+        let show_home_start = tabs_impl
+            .find(
+                "pub(crate) fn show_home(home_page: &Entity<Self>, window: &mut Window, cx: &mut App)",
+            )
+            .unwrap();
+        let show_home_end = tabs_impl[show_home_start..]
+            .find("\n    fn terminal_sync_path_enabled")
+            .map(|offset| show_home_start + offset)
+            .unwrap();
+        let show_home_source = &tabs_impl[show_home_start..show_home_end];
+
+        assert!(show_home_source.contains("window.defer(cx, move |window, cx|"));
+        assert!(show_home_source.contains("try_global::<GlobalOnetCliApp>()"));
+        assert!(show_home_source.contains("app.show_home(window, cx)"));
+        assert!(!show_home_source.contains("activate_base_content"));
+        assert!(rail_source.contains("|home, window, cx| HomePage::show_home(home, window, cx)"));
+    }
+
+    #[test]
+    fn home_page_connection_openers_defer_active_tab_changes() {
+        let tabs_source = include_str!("home_tabs.rs").replace("\r\n", "\n");
+        let tabs_impl = tabs_source.split_once("\nimpl HomePage {\n").unwrap().1;
+        let forwarding_source = include_str!("../home_tab/forwarding.rs").replace("\r\n", "\n");
+        let forwarding_impl = forwarding_source
+            .split_once("\nimpl HomePage {\n")
+            .unwrap()
+            .1;
+
+        for (method, next_method) in [
+            (
+                "pub(crate) fn open_ssh_terminal_with_mode",
+                "pub(crate) fn open_serial_terminal",
+            ),
+            (
+                "pub(crate) fn open_serial_terminal_with_mode",
+                "pub(crate) fn open_sftp_view",
+            ),
+            (
+                "pub(crate) fn open_sftp_view",
+                "pub(crate) fn open_remote_desktop_with_mode",
+            ),
+            (
+                "pub(crate) fn open_remote_desktop_with_mode",
+                "pub(crate) fn open_redis_tab_with_mode",
+            ),
+        ] {
+            let start = tabs_impl.find(method).unwrap();
+            let end = tabs_impl[start..]
+                .find(next_method)
+                .map(|offset| start + offset)
+                .unwrap();
+            let method_source = &tabs_impl[start..end];
+
+            assert!(
+                method_source.contains("window.defer(cx, move |window, cx|"),
+                "{method} must defer TabContainer activation to avoid re-entering HomePage"
+            );
+        }
+
+        let start = forwarding_impl
+            .find("pub(crate) fn open_port_forwarding_tab")
+            .unwrap();
+        let end = forwarding_impl[start..]
+            .find("pub(super) fn port_forwarding_tab_config")
+            .map(|offset| start + offset)
+            .unwrap();
+        let method_source = &forwarding_impl[start..end];
+        assert!(method_source.contains("window.defer(cx, move |window, cx|"));
     }
 
     #[test]
     fn persistent_sidebar_uses_shared_rail_geometry_and_icon_scale() {
         let source = include_str!("../persistent_connection_sidebar/rail.rs").replace("\r\n", "\n");
+        let sections = include_str!("../persistent_connection_sidebar/navigation_sections.rs")
+            .replace("\r\n", "\n");
         let geometry = include_str!("../../../crates/ui/src/theme/geometry.rs");
         let visuals = include_str!("../connection_visuals.rs");
 
-        assert!(source.contains("items_center().gap_1().p_1()"));
+        assert!(sections.contains("items_center().gap_1().p_1()"));
         assert!(source.contains("let rail_width = layout.global_rail"));
         assert!(source.contains("let rail_item_size = Size::Size(layout.global_rail_item)"));
-        assert!(source.contains("connection_type_rail_icon(filter)"));
+        assert!(sections.contains("connection_type_rail_icon(filter)"));
         assert!(visuals.contains("Self::Inline | Self::Rail => IconSize::Medium"));
         assert!(geometry.contains("global_rail: px(52.)"));
         assert!(geometry.contains("global_rail_item: px(40.)"));
-        assert!(source.matches(".hit_size(rail_item_size)").count() >= 2);
+        assert!(source.contains(".hit_size(rail_item_size)"));
+        assert!(sections.matches(".hit_size(visuals.item_size)").count() >= 2);
         assert!(source.contains(".with_size(IconSize::Medium)"));
+        assert!(sections.contains(".glyph_size(IconSize::Medium)"));
     }
 
     #[test]
     fn persistent_sidebar_uses_line_style_rail_icons() {
-        let source = include_str!("../persistent_connection_sidebar/rail.rs");
+        let sections = include_str!("../persistent_connection_sidebar/navigation_sections.rs");
         let icons = include_str!("../../../crates/ui/src/icon.rs");
         let visuals = include_str!("../connection_visuals.rs");
         let remote_render = include_str!("../../../crates/remote_desktop_view/src/view/render.rs");
@@ -149,13 +619,16 @@ mod tests {
         let rdp = include_str!("../../../crates/assets/assets/icons/rdp.svg");
         let vnc = include_str!("../../../crates/assets/assets/icons/vnc.svg");
 
-        assert!(source.contains("IconName::User"));
-        assert!(source.contains("connection_type_rail_icon"));
-        assert!(visuals.contains("ConnectionType::All => ConnectionVisual"));
-        assert!(visuals.contains("navigation_icon: IconName::ServerLine"));
-        assert!(visuals.contains("navigation_icon: IconName::RdpLine"));
-        assert!(visuals.contains("identity_icon: ColorObject(IconName::Rdp)"));
-        assert!(visuals.contains("identity_icon: ColorObject(IconName::Vnc)"));
+        assert!(sections.contains("IconName::User"));
+        assert!(sections.contains("connection_type_rail_icon"));
+        assert!(visuals.contains("ConnectionType::All => IconName::ServerLine"));
+        assert!(visuals.contains("ConnectionType::SshSftp => IconName::TerminalLine"));
+        assert!(visuals.contains("ConnectionType::Rdp => IconName::RdpLine"));
+        assert!(visuals.contains("ConnectionType::Vnc => IconName::VncLine"));
+        assert!(visuals.contains(".mono()"));
+        assert!(visuals.contains("ConnectionType::Rdp => IconName::Rdp"));
+        assert!(visuals.contains("ConnectionType::Vnc => IconName::Vnc"));
+        assert!(visuals.contains(".color()"));
         assert!(icons.contains("icons/user.svg"));
         assert!(icons.contains("icons/server_line.svg"));
         assert!(icons.contains("icons/rdp_line.svg"));
@@ -178,13 +651,27 @@ mod tests {
     fn ai_workbench_sidebar_entry_opens_a_closeable_regular_tab() {
         let tabs_source = include_str!("home_tabs.rs").replace("\r\n", "\n");
         let rail_source = include_str!("../persistent_connection_sidebar/rail.rs");
-        let legacy_sidebar_source = include_str!("../home_tab/sidebar.rs");
+        let persistent_navigation_source =
+            include_str!("../persistent_connection_sidebar/navigation_sections.rs");
+        let legacy_sidebar_source = include_str!("../home_tab/sidebar_navigation.rs");
+        let legacy_sidebar_layout_source = include_str!("../home_tab/sidebar.rs");
+        let navigation_source = include_str!("../home_tab/navigation.rs");
 
-        assert!(rail_source.contains("persistent-open-ai-workbench"));
+        assert!(persistent_navigation_source.contains("persistent-open-ai-workbench"));
         assert!(rail_source.contains("StartupDefaultPage::Home"));
         assert!(legacy_sidebar_source.contains("legacy-open-ai-workbench"));
-        assert!(legacy_sidebar_source.contains("StartupDefaultPage::Home"));
-        assert!(legacy_sidebar_source.contains("home.add_ai_workbench_tab(window, cx)"));
+        assert!(legacy_sidebar_layout_source.contains("StartupDefaultPage::Home"));
+        assert!(
+            legacy_sidebar_source
+                .contains("home.activate_navigation_application(application, window, cx)")
+        );
+        assert!(
+            persistent_navigation_source
+                .contains("home.activate_navigation_application(application, window, cx)")
+        );
+        assert!(navigation_source.contains(
+            "NavigationApplication::AiWorkbench => self.add_ai_workbench_tab(window, cx)"
+        ));
         assert!(tabs_source.contains("fn add_ai_workbench_tab"));
         assert!(tabs_source.contains("with_tab_closeable(true)"));
         assert!(
@@ -224,6 +711,7 @@ mod tests {
                 port: 3389,
                 username: None,
                 password: None,
+                credential_reference: None,
                 domain: None,
                 read_only: false,
                 audio_playback: true,
@@ -233,12 +721,19 @@ mod tests {
                     port: 8080,
                     username: Some("alice".to_string()),
                     password: Some("secret".to_string()),
+                    credential_reference: None,
                 }),
+                backend_preference: RemoteDesktopBackendPreference::WindowsNative,
+                rdp: None,
             },
             None,
         );
 
         let options = remote_desktop_options(&connection, RemoteDesktopProtocol::Rdp).unwrap();
+        assert_eq!(
+            RemoteDesktopBackendPreference::WindowsNative,
+            options.backend_preference
+        );
         let proxy = options.proxy.expect("proxy should be mapped");
 
         assert!(options.audio_playback);
@@ -257,17 +752,57 @@ mod tests {
                 port: 5900,
                 username: None,
                 password: None,
+                credential_reference: None,
                 domain: None,
                 read_only: false,
                 audio_playback: true,
                 proxy: None,
+                backend_preference: RemoteDesktopBackendPreference::WindowsNative,
+                rdp: None,
             },
             None,
         );
 
         let options = remote_desktop_options(&connection, RemoteDesktopProtocol::Vnc).unwrap();
 
+        assert_eq!(
+            RemoteDesktopBackendPreference::Canvas,
+            options.backend_preference
+        );
         assert!(!options.audio_playback);
+    }
+
+    #[test]
+    fn remote_desktop_tab_resolves_credentials_before_building_options() {
+        let source = include_str!("home_tabs.rs").replace("\r\n", "\n");
+        let implementation = source
+            .split_once("\nimpl HomePage {\n")
+            .expect("HomePage implementation")
+            .1;
+        let method_start = implementation
+            .find("pub(crate) fn open_remote_desktop_with_mode")
+            .expect("remote desktop open method");
+        let method_end = implementation[method_start..]
+            .find("pub(crate) fn open_redis_tab_with_mode")
+            .map(|offset| method_start + offset)
+            .expect("next method");
+        let method = &implementation[method_start..method_end];
+        let resolve = method
+            .find("resolve_connection_credentials(")
+            .and_then(|offset| {
+                method[offset..]
+                    .find("window, cx)")
+                    .map(|next| offset + next + "window, cx)".len())
+            })
+            .expect("credential resolution");
+        let options = method
+            .find("remote_desktop_options(&conn, protocol)")
+            .expect("remote desktop options");
+
+        assert!(
+            resolve < options,
+            "RDP/VNC credentials must be resolved before runtime options are built"
+        );
     }
 
     #[test]
@@ -307,6 +842,35 @@ impl HomePage {
         cx.try_global::<GlobalTabContainer>()
             .map(|global| global.primary_pane())
             .unwrap_or_else(|| self.tab_container.clone())
+    }
+
+    pub(crate) fn is_home_active(&self) -> bool {
+        self.home_active
+    }
+
+    pub(crate) fn set_home_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.home_active == active {
+            return;
+        }
+        self.home_active = active;
+        cx.notify();
+    }
+
+    pub(crate) fn show_home(home_page: &Entity<Self>, window: &mut Window, cx: &mut App) {
+        let app = cx
+            .try_global::<GlobalOnetCliApp>()
+            .map(|global| global.app.clone());
+        let home_page = home_page.clone();
+        window.defer(cx, move |window, cx| {
+            if let Some(app) = app {
+                app.update(cx, |app, cx| app.show_home(window, cx));
+            } else {
+                home_page.update(cx, |home, cx| {
+                    home.focus_handle(cx).focus(window, cx);
+                    cx.notify();
+                });
+            }
+        });
     }
 
     fn terminal_sync_path_enabled(cx: &App) -> bool {
@@ -356,9 +920,11 @@ impl HomePage {
         let terminal_view = cx.new(|cx| {
             TerminalWorkspace::new_ssh_with_index(conn, tab_index, window, cx, None, sync_path)
         });
-        tab_container.update(cx, |tc, cx| {
-            let tab = TabItem::new(tab_id, "ssh", terminal_view);
-            tc.add_tab_with_mode(tab, mode, window, cx);
+        window.defer(cx, move |window, cx| {
+            tab_container.update(cx, |tc, cx| {
+                let tab = TabItem::new(tab_id, "ssh", terminal_view);
+                tc.add_tab_with_mode(tab, mode, window, cx);
+            });
         });
     }
 
@@ -401,9 +967,58 @@ impl HomePage {
 
         let terminal_view =
             cx.new(|cx| TerminalWorkspace::new_serial_with_index(conn, tab_index, window, cx));
-        tab_container.update(cx, |tc, cx| {
-            let tab = TabItem::new(tab_id, "serial", terminal_view);
-            tc.add_tab_with_mode(tab, mode, window, cx);
+        window.defer(cx, move |window, cx| {
+            tab_container.update(cx, |tc, cx| {
+                let tab = TabItem::new(tab_id, "serial", terminal_view);
+                tc.add_tab_with_mode(tab, mode, window, cx);
+            });
+        });
+    }
+
+    pub(crate) fn open_telnet_terminal(
+        &mut self,
+        conn: StoredConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_telnet_terminal_with_mode(conn, TabOpenMode::Activate, window, cx);
+    }
+
+    pub(crate) fn open_telnet_terminal_with_mode(
+        &mut self,
+        conn: StoredConnection,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let conn_id = conn.id.unwrap_or(0);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let tab_id = format!("telnet-terminal-{}-{}", conn_id, timestamp);
+
+        let prefix = format!("telnet-terminal-{}-", conn_id);
+        let tab_container = self.active_tab_container(cx);
+        let existing_count = tab_container
+            .read(cx)
+            .tabs()
+            .iter()
+            .filter(|t| t.id().starts_with(&prefix))
+            .count();
+        let tab_index = if existing_count > 0 {
+            Some(existing_count + 1)
+        } else {
+            None
+        };
+
+        let terminal_view =
+            cx.new(|cx| TerminalWorkspace::new_telnet_with_index(conn, tab_index, window, cx));
+        window.defer(cx, move |window, cx| {
+            tab_container.update(cx, |tc, cx| {
+                let tab = TabItem::new(tab_id, "telnet", terminal_view);
+                tc.add_tab_with_mode(tab, mode, window, cx);
+            });
         });
     }
 
@@ -532,8 +1147,10 @@ impl HomePage {
 
         // 添加标签页
         let tab = TabItem::new(tab_id, "sftp", sftp_view);
-        tab_container.update(cx, |tc, cx| {
-            tc.add_and_activate_tab_with_focus(tab, window, cx);
+        window.defer(cx, move |window, cx| {
+            tab_container.update(cx, |tc, cx| {
+                tc.add_and_activate_tab_with_focus(tab, window, cx);
+            });
         });
     }
 
@@ -545,6 +1162,9 @@ impl HomePage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(conn) = resolve_connection_credentials(&conn, window, cx) else {
+            return;
+        };
         let Some(options) = remote_desktop_options(&conn, protocol) else {
             tracing::warn!(
                 connection_id = ?conn.id,
@@ -586,9 +1206,11 @@ impl HomePage {
                 cx,
             )
         });
-        tab_container.update(cx, |tc, cx| {
-            let tab = TabItem::new(tab_id, tab_kind, view);
-            tc.add_tab_with_mode(tab, mode, window, cx);
+        window.defer(cx, move |window, cx| {
+            tab_container.update(cx, |tc, cx| {
+                let tab = TabItem::new(tab_id, tab_kind, view);
+                tc.add_tab_with_mode(tab, mode, window, cx);
+            });
         });
     }
 
@@ -778,6 +1400,75 @@ impl HomePage {
         });
     }
 
+    #[cfg(feature = "api-testing")]
+    pub(crate) fn add_api_test_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tab_container = self.active_tab_container(cx);
+        window.defer(cx, move |window, cx| {
+            tab_container.update(cx, |tabs, cx| {
+                tabs.activate_or_add_tab_lazy(
+                    "api-testing",
+                    |window, cx| {
+                        let view = cx.new(|cx| ApiTestView::new(window, cx));
+                        TabItem::new("api-testing", "home", view)
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+    }
+
+    pub(crate) fn add_json_formatter_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tab_container = self.active_tab_container(cx);
+        window.defer(cx, move |window, cx| {
+            tab_container.update(cx, |tabs, cx| {
+                tabs.activate_or_add_tab_lazy(
+                    "json-formatter",
+                    |window, cx| {
+                        let view = cx.new(|cx| JsonFormatterView::new(window, cx));
+                        TabItem::new("json-formatter", "home", view)
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+    }
+
+    pub(crate) fn add_session_logs_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tab_container = self.active_tab_container(cx);
+        window.defer(cx, move |window, cx| {
+            tab_container.update(cx, |tabs, cx| {
+                tabs.activate_or_add_tab_lazy(
+                    "session-logs",
+                    |window, cx| {
+                        let page = cx.new(|cx| SessionLogsPage::new(window, cx));
+                        TabItem::new("session-logs", "home", page)
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+    }
+
+    pub(crate) fn add_credential_vault_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tab_container = self.active_tab_container(cx);
+        window.defer(cx, move |window, cx| {
+            tab_container.update(cx, |tabs, cx| {
+                tabs.activate_or_add_tab_lazy(
+                    "credential-vault",
+                    |window, cx| {
+                        let vault = cx.new(|cx| CredentialVaultView::new(window, cx));
+                        TabItem::new("credential-vault", "home", vault)
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+    }
+
     pub(crate) fn add_ai_workbench_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let tab_container = self.active_tab_container(cx);
         let (scope, catalog, mentions) =
@@ -914,16 +1605,14 @@ impl HomePage {
         // 在 defer 之前准备所有需要的数据，避免在 HomePage 更新期间
         // 触发 on_deactivate 导致双重借用 panic
         let workspace_id = workspace.as_ref().and_then(|w| w.id);
-        let conn_clone = conn.clone();
-        let connections: Vec<StoredConnection> = match open_mode {
-            DatabaseOpenMode::Workspace if workspace_id.is_some() => self
-                .connections
-                .iter()
-                .filter(|c| c.workspace_id == workspace_id)
-                .filter(|c| c.connection_type == ConnectionType::Database)
-                .cloned()
-                .collect(),
-            _ => vec![conn.clone()],
+        let Some((conn_clone, connections)) = database_tab_connection_context(
+            open_mode,
+            conn,
+            workspace_id,
+            &self.connections,
+            |connection| resolve_connection_credentials(connection, window, cx),
+        ) else {
+            return;
         };
 
         let tab_container = self.active_tab_container(cx);
@@ -1036,6 +1725,19 @@ impl HomePage {
                             }
                         }
                     }
+                    TerminalConnectionKind::Telnet => {
+                        let conn_id = terminal_view.read(cx).connection_id(cx);
+                        if let Some(conn_id) = conn_id {
+                            if let Some(conn) = self
+                                .connections
+                                .iter()
+                                .find(|c| c.id == Some(conn_id))
+                                .cloned()
+                            {
+                                self.open_telnet_terminal(conn, window, cx);
+                            }
+                        }
+                    }
                     TerminalConnectionKind::Local => {
                         // 本地终端：直接新建
                         self.add_terminal_tab(window, cx);
@@ -1053,42 +1755,12 @@ pub(crate) fn remote_desktop_options(
     conn: &StoredConnection,
     protocol: RemoteDesktopProtocol,
 ) -> Option<RemoteDesktopConnectionOptions> {
-    let params = conn.to_remote_desktop_params().ok()?;
-    Some(RemoteDesktopConnectionOptions {
-        protocol,
-        destination: format!("{}:{}", params.host, params.port),
-        username: params.username,
-        password: params.password,
-        domain: params.domain,
-        read_only: params.read_only,
-        audio_playback: protocol == RemoteDesktopProtocol::Rdp && params.audio_playback,
-        audio_capture: false,
-        shared_folders: Vec::new(),
-        proxy: params.proxy.map(remote_desktop_proxy_config),
-    })
-}
-
-fn remote_desktop_proxy_config(proxy: ProxyConfig) -> remote_desktop::ProxyTunnelConfig {
-    remote_desktop::ProxyTunnelConfig {
-        proxy_type: match proxy.proxy_type {
-            ProxyType::Socks5 => remote_desktop::ProxyTunnelType::Socks5,
-            ProxyType::Http => remote_desktop::ProxyTunnelType::Http,
-        },
-        host: proxy.host.trim().to_string(),
-        port: proxy.port,
-        username: normalized_optional(proxy.username),
-        password: preserved_secret(proxy.password),
-    }
-}
-
-fn normalized_optional(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn preserved_secret(value: Option<String>) -> Option<String> {
-    value.filter(|value| !value.is_empty())
+    let mut params = conn.to_remote_desktop_params().ok()?;
+    params.protocol = match protocol {
+        RemoteDesktopProtocol::Rdp => one_core::storage::RemoteDesktopProtocol::Rdp,
+        RemoteDesktopProtocol::Vnc => one_core::storage::RemoteDesktopProtocol::Vnc,
+    };
+    Some(RemoteDesktopConnectionOptions::from_storage_params(params))
 }
 
 fn push_local_terminal_config_error<T>(

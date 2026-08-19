@@ -1,4 +1,5 @@
 use super::*;
+use gpui_component::scroll::ScrollableElement;
 
 impl TerminalView {
     pub(super) fn render_connection_banner(
@@ -71,7 +72,7 @@ impl TerminalView {
                     .rounded_lg()
                     .shadow_lg()
                     .child(self.render_connection_dialog_title(cx))
-                    .when_some(self.render_ssh_mfa_form(cx), |this, form| this.child(form)),
+                    .when_some(self.render_auth_form(cx), |this, form| this.child(form)),
             )
             .into_any_element()
     }
@@ -140,7 +141,9 @@ impl TerminalView {
                 this.child(
                     div()
                         .w_full()
-                        .truncate()
+                        .max_h(px(180.0))
+                        .overflow_scrollbar()
+                        .whitespace_normal()
                         .text_sm()
                         .text_color(theme.danger)
                         .child(message),
@@ -151,6 +154,14 @@ impl TerminalView {
 
     fn render_connection_dialog_title(&self, cx: &App) -> AnyElement {
         let theme = cx.theme();
+        let terminal = self.terminal.read(cx);
+        let title = if terminal.telnet_credential_request().is_some() {
+            t!("TelnetSession.credentials_required")
+        } else if terminal.ssh_credential_request().is_some() {
+            t!("SshSession.credentials_required")
+        } else {
+            t!("SshSession.authentication_required")
+        };
         h_flex()
             .gap_2()
             .child(
@@ -164,9 +175,96 @@ impl TerminalView {
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.popover_foreground)
-                    .child(t!("SshSession.authentication_required")),
+                    .child(title),
             )
             .into_any_element()
+    }
+
+    fn render_auth_form(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.render_credential_form(cx)
+            .or_else(|| self.render_ssh_mfa_form(cx))
+    }
+
+    fn render_credential_form(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let inputs = self.credential_inputs.as_ref()?;
+        let request_matches = {
+            let terminal = self.terminal.read(cx);
+            match &inputs.request {
+                TerminalCredentialRequest::Ssh(request) => {
+                    terminal.ssh_credential_request().as_ref() == Some(request)
+                }
+                TerminalCredentialRequest::Telnet(request) => {
+                    terminal.telnet_credential_request().as_ref() == Some(request)
+                }
+            }
+        };
+        if !request_matches {
+            return None;
+        }
+        let is_telnet = inputs.request.is_telnet();
+
+        Some(
+            v_flex()
+                .gap_3()
+                .w_full()
+                .items_center()
+                .child(
+                    div()
+                        .w(px(400.0))
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if is_telnet {
+                            t!("TelnetSession.credentials_hint")
+                        } else {
+                            t!("SshSession.credentials_hint")
+                        }),
+                )
+                .when_some(inputs.username.as_ref(), |this, input| {
+                    this.child(
+                        v_flex()
+                            .w(px(400.0))
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if is_telnet {
+                                        t!("TelnetSession.username")
+                                    } else {
+                                        t!("SshSession.username")
+                                    }),
+                            )
+                            .child(Input::new(input)),
+                    )
+                })
+                .when_some(inputs.password.as_ref(), |this, input| {
+                    this.child(
+                        v_flex()
+                            .w(px(400.0))
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if is_telnet {
+                                        t!("TelnetSession.password")
+                                    } else {
+                                        t!("SshSession.password")
+                                    }),
+                            )
+                            .child(Input::new(input).mask_toggle()),
+                    )
+                })
+                .child(
+                    Button::new("submit-terminal-credentials")
+                        .label(t!("Common.ok"))
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.submit_credentials(window, cx);
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_ssh_mfa_form(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

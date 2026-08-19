@@ -3,11 +3,13 @@ use gpui::{App, SharedString};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::storage::connection::SqliteConnection;
+use crate::storage::credential_vault::CredentialRepository;
 use crate::storage::manager::{GlobalStorageState, now};
 use crate::storage::models::has_decrypt_failure_in_sensitive_fields;
 use crate::storage::quick_command::QuickCommandRepository;
 use crate::storage::row_mapping::FromSqliteRow;
 use crate::storage::sftp_favorite_path::SftpFavoritePathRepository;
+use crate::storage::sql_execution_history::SqlExecutionHistoryRepository;
 use crate::storage::team_key_cache::TeamKeyCacheRepository;
 use crate::storage::team_membership_cache::TeamMembershipCacheRepository;
 use crate::storage::terminal_command_history::TerminalCommandHistoryRepository;
@@ -99,6 +101,7 @@ struct WorkspaceRow {
     cloud_id: Option<String>,
     last_synced_at: Option<i64>,
     sort_order: Option<i32>,
+    sidebar_collapsed: bool,
 }
 
 impl FromSqliteRow for WorkspaceRow {
@@ -114,6 +117,7 @@ impl FromSqliteRow for WorkspaceRow {
             cloud_id: row.get("cloud_id")?,
             last_synced_at: row.get("last_synced_at").unwrap_or(None),
             sort_order: row.get("sort_order").unwrap_or(Some(0)),
+            sidebar_collapsed: row.get("sidebar_collapsed").unwrap_or(false),
         })
     }
 }
@@ -131,6 +135,7 @@ impl From<WorkspaceRow> for Workspace {
             cloud_id: row.cloud_id,
             last_synced_at: row.last_synced_at,
             sort_order: row.sort_order,
+            sidebar_collapsed: row.sidebar_collapsed,
         }
     }
 }
@@ -143,6 +148,14 @@ pub struct ConnectionRepository {
 impl ConnectionRepository {
     pub fn new(conn: SqliteConnection) -> Self {
         Self { conn }
+    }
+
+    /// Returns a credential repository backed by the same local database.
+    ///
+    /// Runtime connection consumers use this to resolve vault references into
+    /// temporary connection clones immediately before connecting.
+    pub fn credential_repository(&self) -> CredentialRepository {
+        CredentialRepository::new(self.conn.clone())
     }
 
     pub fn get_for_sensitive_export(
@@ -614,6 +627,26 @@ impl WorkspaceRepository {
         })
     }
 
+    pub fn update_sidebar_collapsed(&self, workspace_id: i64, collapsed: bool) -> Result<()> {
+        self.conn.with_connection(|conn| {
+            conn.execute(
+                "UPDATE workspaces SET sidebar_collapsed = ?1 WHERE id = ?2",
+                params![collapsed, workspace_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn set_all_sidebar_collapsed(&self, collapsed: bool) -> Result<()> {
+        self.conn.with_connection(|conn| {
+            conn.execute(
+                "UPDATE workspaces SET sidebar_collapsed = ?1",
+                params![collapsed],
+            )?;
+            Ok(())
+        })
+    }
+
     fn next_sort_order(&self) -> Result<i32> {
         self.conn.with_connection(|conn| {
             let max_order: Option<i32> =
@@ -640,12 +673,13 @@ impl Repository for WorkspaceRepository {
         let cloud_id = item.cloud_id.clone();
         let last_synced_at = item.last_synced_at;
         let sort_order = item.sort_order.unwrap_or(self.next_sort_order()?);
+        let sidebar_collapsed = item.sidebar_collapsed;
         let ts = now();
 
         let id = self.conn.with_connection(|conn| {
             conn.execute(
-                "INSERT INTO workspaces (name, color, icon, parent_id, cloud_id, last_synced_at, sort_order, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![name, color, icon, parent_id, cloud_id, last_synced_at, sort_order, ts, ts],
+                "INSERT INTO workspaces (name, color, icon, parent_id, cloud_id, last_synced_at, sort_order, sidebar_collapsed, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![name, color, icon, parent_id, cloud_id, last_synced_at, sort_order, sidebar_collapsed, ts, ts],
             )?;
             Ok(conn.last_insert_rowid())
         })?;
@@ -669,12 +703,13 @@ impl Repository for WorkspaceRepository {
         let cloud_id = item.cloud_id.clone();
         let last_synced_at = item.last_synced_at;
         let sort_order = item.sort_order;
+        let sidebar_collapsed = item.sidebar_collapsed;
         let ts = now();
 
         self.conn.with_connection(|conn| {
             conn.execute(
-                "UPDATE workspaces SET name = ?1, color = ?2, icon = ?3, parent_id = ?4, cloud_id = ?5, last_synced_at = ?6, sort_order = COALESCE(?7, sort_order), updated_at = ?8 WHERE id = ?9",
-                params![name, color, icon, parent_id, cloud_id, last_synced_at, sort_order, ts, id],
+                "UPDATE workspaces SET name = ?1, color = ?2, icon = ?3, parent_id = ?4, cloud_id = ?5, last_synced_at = ?6, sort_order = COALESCE(?7, sort_order), sidebar_collapsed = ?8, updated_at = ?9 WHERE id = ?10",
+                params![name, color, icon, parent_id, cloud_id, last_synced_at, sort_order, sidebar_collapsed, ts, id],
             )?;
             Ok(())
         })
@@ -699,7 +734,7 @@ impl Repository for WorkspaceRepository {
 
     fn get(&self, id: i64) -> Result<Option<Self::Entity>> {
         self.conn.with_connection(|conn| {
-            let mut stmt = conn.prepare("SELECT id, name, color, icon, parent_id, created_at, updated_at, cloud_id, last_synced_at, sort_order FROM workspaces WHERE id = ?1")?;
+            let mut stmt = conn.prepare("SELECT id, name, color, icon, parent_id, created_at, updated_at, cloud_id, last_synced_at, sort_order, sidebar_collapsed FROM workspaces WHERE id = ?1")?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
                 Ok(Some(WorkspaceRow::from_row(row)?.into()))
@@ -711,7 +746,7 @@ impl Repository for WorkspaceRepository {
 
     fn list(&self) -> Result<Vec<Self::Entity>> {
         self.conn.with_connection(|conn| {
-            let mut stmt = conn.prepare("SELECT id, name, color, icon, parent_id, created_at, updated_at, cloud_id, last_synced_at, sort_order FROM workspaces ORDER BY sort_order ASC, updated_at DESC, id DESC")?;
+            let mut stmt = conn.prepare("SELECT id, name, color, icon, parent_id, created_at, updated_at, cloud_id, last_synced_at, sort_order, sidebar_collapsed FROM workspaces ORDER BY sort_order ASC, updated_at DESC, id DESC")?;
             let rows = stmt.query_map([], |row| WorkspaceRow::from_row(row))?;
             let mut results = Vec::new();
             for row in rows {
@@ -881,6 +916,12 @@ mod tests {
                 port: 22,
                 username: "deploy".to_string(),
                 auth_method: SshAuthMethod::Agent,
+                credential_reference: None,
+                prompt_username: None,
+                prompt_password: None,
+                keyboard_interactive: None,
+                terminal_encoding: Default::default(),
+                terminal_type: Default::default(),
                 connect_timeout: None,
                 keepalive_interval: None,
                 keepalive_max: None,
@@ -893,6 +934,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         )
@@ -950,6 +992,47 @@ mod tests {
     }
 
     #[test]
+    fn workspace_names_are_unique_within_each_parent() {
+        let (conn, _) = test_repository();
+        let repo = WorkspaceRepository::new(conn);
+        let mut first_parent = workspace("first parent");
+        let first_parent_id = repo.insert(&mut first_parent).unwrap();
+        let mut second_parent = workspace("second parent");
+        let second_parent_id = repo.insert(&mut second_parent).unwrap();
+
+        let mut first_child = workspace("servers");
+        first_child.parent_id = Some(first_parent_id);
+        repo.insert(&mut first_child).unwrap();
+
+        let mut second_child = workspace("servers");
+        second_child.parent_id = Some(second_parent_id);
+        repo.insert(&mut second_child).unwrap();
+
+        let mut root = workspace("servers");
+        repo.insert(&mut root).unwrap();
+
+        let mut duplicate_sibling = workspace("servers");
+        duplicate_sibling.parent_id = Some(first_parent_id);
+        assert!(repo.insert(&mut duplicate_sibling).is_err());
+
+        let mut duplicate_root = workspace("servers");
+        assert!(repo.insert(&mut duplicate_root).is_err());
+
+        second_child.parent_id = Some(first_parent_id);
+        assert!(repo.update(&second_child).is_err());
+        assert_eq!(
+            Some(second_parent_id),
+            repo.get(second_child.id.unwrap())
+                .unwrap()
+                .unwrap()
+                .parent_id
+        );
+
+        repo.update(&first_child)
+            .expect("updating a workspace without changing its scoped name");
+    }
+
+    #[test]
     fn workspace_cloud_update_does_not_flatten_local_hierarchy() {
         let (conn, _) = test_repository();
         let repo = WorkspaceRepository::new(conn);
@@ -991,6 +1074,53 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(vec![Some(second_id), Some(first_id)], listed_ids);
+    }
+
+    #[test]
+    fn workspace_repository_persists_sidebar_collapsed_without_touching_updated_at() {
+        let (conn, _) = test_repository();
+        let repo = WorkspaceRepository::new(conn);
+        let mut item = workspace("collapsed");
+        let id = repo.insert(&mut item).unwrap();
+        let initial_updated_at = item.updated_at;
+
+        repo.update_sidebar_collapsed(id, true).unwrap();
+
+        let stored = repo.get(id).unwrap().unwrap();
+        assert!(stored.sidebar_collapsed);
+        assert_eq!(initial_updated_at, stored.updated_at);
+    }
+
+    #[test]
+    fn workspace_cloud_update_preserves_local_sidebar_collapsed_state() {
+        let (conn, _) = test_repository();
+        let repo = WorkspaceRepository::new(conn);
+        let mut item = workspace("local");
+        let id = repo.insert(&mut item).unwrap();
+        repo.update_sidebar_collapsed(id, true).unwrap();
+
+        let mut cloud_item = repo.get(id).unwrap().unwrap();
+        cloud_item.name = "cloud".to_string();
+        cloud_item.sidebar_collapsed = false;
+        repo.update_from_cloud(&cloud_item).unwrap();
+
+        let stored = repo.get(id).unwrap().unwrap();
+        assert_eq!("cloud", stored.name);
+        assert!(stored.sidebar_collapsed);
+    }
+
+    #[test]
+    fn workspace_sidebar_collapsed_is_excluded_from_serialized_sync_data() {
+        let mut item = workspace("local");
+        item.sidebar_collapsed = true;
+
+        let serialized = serde_json::to_value(&item).unwrap();
+
+        assert!(
+            serialized
+                .as_object()
+                .is_some_and(|fields| !fields.contains_key("sidebar_collapsed"))
+        );
     }
 
     #[test]
@@ -1230,6 +1360,12 @@ mod tests {
             auth_method: SshAuthMethod::Password {
                 password: "plaintext-secret".to_string(),
             },
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            keyboard_interactive: None,
+            terminal_encoding: Default::default(),
+            terminal_type: Default::default(),
             connect_timeout: None,
             keepalive_interval: None,
             keepalive_max: None,
@@ -1242,6 +1378,7 @@ mod tests {
             proxy: None,
             os_id: None,
             icon: None,
+            account_expect: Default::default(),
         })
         .expect("serialize SSH params");
         conn.with_connection(|conn| {
@@ -1450,9 +1587,11 @@ pub fn init(cx: &mut App) {
 
     let conn = storage.connection();
     let conn_repo = ConnectionRepository::new(conn.clone());
+    let credential_repo = CredentialRepository::new(conn.clone());
     let workspace_repo = WorkspaceRepository::new(conn.clone());
     let quick_cmd_repo = QuickCommandRepository::new(conn.clone());
     let sftp_favorite_path_repo = SftpFavoritePathRepository::new(conn.clone());
+    let sql_execution_history_repo = SqlExecutionHistoryRepository::new(conn.clone());
     let terminal_command_history_repo = TerminalCommandHistoryRepository::new(conn.clone());
     let pending_deletion_repo = PendingCloudDeletionRepository::new(conn.clone());
     let team_key_cache_repo = TeamKeyCacheRepository::new(conn.clone());
@@ -1464,8 +1603,10 @@ pub fn init(cx: &mut App) {
 
     storage.register(workspace_repo);
     storage.register(conn_repo);
+    storage.register(credential_repo);
     storage.register(quick_cmd_repo);
     storage.register(sftp_favorite_path_repo);
+    storage.register(sql_execution_history_repo);
     storage.register(terminal_command_history_repo);
     storage.register(pending_deletion_repo);
     storage.register(team_key_cache_repo);

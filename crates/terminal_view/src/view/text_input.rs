@@ -86,6 +86,21 @@ impl TerminalView {
             return;
         }
 
+        // Xshell 风格：会话未激活（未连接/已断开）时 Ctrl+D 关闭当前窗口；
+        // 会话存活时 Ctrl+D 照常透传为 EOF（\x04）退出 shell。
+        if !self.accepts_live_terminal_input(cx) {
+            let modifiers = event.keystroke.modifiers;
+            if modifiers.control
+                && !modifiers.alt
+                && !modifiers.shift
+                && !modifiers.platform
+                && event.keystroke.key == "d"
+            {
+                one_core::window_close::request_close_window(_window.window_handle(), cx);
+            }
+            return;
+        }
+
         if !self.accepts_live_terminal_input(cx) {
             return;
         }
@@ -186,7 +201,12 @@ impl TerminalView {
                 "backspace" => {
                     if self.history_prompt_enabled(cx) {
                         self.history_prompt.backspace();
-                        self.refresh_history_prompt_matches(cx);
+                        if self.history_prompt.query_input().is_empty() {
+                            self.suggestion_debounce.take();
+                            cx.notify();
+                        } else {
+                            self.schedule_debounced_refresh(cx);
+                        }
                     }
                 }
                 "enter" => {
@@ -219,6 +239,19 @@ impl TerminalView {
             self.dismiss_history_prompt();
         } else {
             self.dismiss_history_prompt();
+        }
+
+        if is_terminal_action_shortcut(&event.keystroke, cx) {
+            return;
+        }
+
+        if let Some(command) = self
+            .command_bar
+            .read(cx)
+            .command_for_shortcut(&event.keystroke)
+        {
+            self.write_to_pty(command.into_bytes(), cx);
+            return;
         }
 
         if let Some(esc_str) = crate::keys::to_esc_str(&event.keystroke, &mode, false) {

@@ -9,6 +9,7 @@ pub type KeyBindingOverrides = HashMap<String, Vec<String>>;
 pub mod action_id {
     pub const WINDOW_TOGGLE_ZOOM: &str = "window.toggle_zoom";
     pub const WINDOW_CLOSE_PANEL: &str = "window.close_panel";
+    pub const WINDOW_CLOSE_ACTIVE_WINDOW: &str = WINDOW_CLOSE_PANEL;
     pub const WINDOW_TOGGLE_CONNECTION_SIDEBAR: &str = "window.toggle_connection_sidebar";
     pub const WINDOW_TOGGLE_FULLSCREEN: &str = "window.toggle_fullscreen";
     pub const WINDOW_TOGGLE_ALWAYS_ON_TOP: &str = "window.toggle_always_on_top";
@@ -66,8 +67,14 @@ pub fn shortcuts_for(cx: &App, action_id: &str, defaults: &[&str]) -> Vec<String
 }
 
 pub fn keystroke_matches_shortcuts(keystroke: &Keystroke, shortcuts: &[String]) -> bool {
-    shortcut_spec_from_keystroke(keystroke)
-        .is_some_and(|spec| shortcuts.iter().any(|shortcut| shortcut == &spec))
+    shortcut_spec_from_keystroke(keystroke).is_some_and(|spec| {
+        shortcuts.iter().any(|shortcut| {
+            Keystroke::parse(shortcut)
+                .ok()
+                .and_then(|shortcut| shortcut_spec_from_keystroke(&shortcut))
+                .is_some_and(|shortcut| shortcut == spec)
+        })
+    })
 }
 
 pub fn rebind_keybindings<A>(
@@ -156,7 +163,7 @@ fn shortcut_spec_from_binding(binding: &KeyBinding) -> String {
         .join(" ")
 }
 
-fn shortcut_spec_from_keystroke(keystroke: &Keystroke) -> Option<String> {
+pub fn shortcut_spec_from_keystroke(keystroke: &Keystroke) -> Option<String> {
     let key = keystroke.key.as_str();
     if matches!(key, "ctrl" | "control" | "alt" | "shift" | "cmd" | "win") {
         return None;
@@ -185,7 +192,10 @@ mod tests {
 
     use gpui::{KeyBinding, KeyContext, Keymap, Keystroke, NoAction, actions};
 
-    use super::{keystroke_matches_shortcuts, rebind_shadow_shortcuts, resolve_shortcuts};
+    use super::{
+        keystroke_matches_shortcuts, rebind_shadow_shortcuts, resolve_shortcuts,
+        shortcut_spec_from_keystroke,
+    };
 
     actions!(keybindings_tests, [TestAction]);
 
@@ -272,5 +282,56 @@ mod tests {
 
         assert!(!keystroke_matches_shortcuts(&old, &shortcuts));
         assert!(keystroke_matches_shortcuts(&new, &shortcuts));
+    }
+
+    #[test]
+    fn shortcut_matching_normalizes_stored_specs_and_rejects_invalid_specs() {
+        let noncanonical = vec!["alt-ctrl-c".to_string()];
+        let invalid = vec!["cmd-not-a-real-key".to_string(), "ctrl".to_string()];
+
+        assert!(keystroke_matches_shortcuts(
+            &Keystroke::parse("ctrl-alt-c").expect("parse shortcut"),
+            &noncanonical
+        ));
+        assert!(!keystroke_matches_shortcuts(
+            &Keystroke::parse("ctrl-c").expect("parse shortcut"),
+            &invalid
+        ));
+        assert!(!keystroke_matches_shortcuts(
+            &Keystroke::parse("ctrl").expect("parse modifier"),
+            &invalid
+        ));
+    }
+
+    #[test]
+    fn shortcut_spec_normalizes_modifier_order_and_rejects_modifier_only_keys() {
+        assert_eq!(
+            Some("ctrl-alt-shift-cmd-k".to_string()),
+            shortcut_spec_from_keystroke(
+                &Keystroke::parse("cmd-shift-alt-ctrl-k").expect("parse shortcut")
+            )
+        );
+        assert_eq!(
+            None,
+            shortcut_spec_from_keystroke(&Keystroke::parse("ctrl").expect("parse modifier"))
+        );
+    }
+
+    #[test]
+    fn shortcut_matching_requires_the_complete_modifier_set() {
+        let shortcuts = vec!["ctrl-alt-c".to_string()];
+
+        assert!(keystroke_matches_shortcuts(
+            &Keystroke::parse("ctrl-alt-c").expect("parse exact shortcut"),
+            &shortcuts
+        ));
+        assert!(!keystroke_matches_shortcuts(
+            &Keystroke::parse("ctrl-c").expect("parse missing modifier"),
+            &shortcuts
+        ));
+        assert!(!keystroke_matches_shortcuts(
+            &Keystroke::parse("ctrl-alt-shift-c").expect("parse extra modifier"),
+            &shortcuts
+        ));
     }
 }

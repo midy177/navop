@@ -31,6 +31,7 @@ impl TerminalView {
                 tab_index,
                 duplicate_source: Some(duplicate_source),
                 recording_playback_name: None,
+                session_log_name: None,
             },
             window,
             cx,
@@ -81,6 +82,7 @@ impl TerminalView {
                 tab_index,
                 duplicate_source: Some(duplicate_source),
                 recording_playback_name: None,
+                session_log_name: None,
             },
             window,
             cx,
@@ -106,6 +108,33 @@ impl TerminalView {
                 tab_index: None,
                 duplicate_source: None,
                 recording_playback_name: Some(display_name),
+                session_log_name: None,
+            },
+            window,
+            cx,
+        )
+    }
+
+    pub fn new_session_log(
+        config: SessionLogViewConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (playback, display_name) = config.into_parts();
+        let display_name = recording_playback_display_name(display_name.as_ref());
+        let terminal = cx.new(|cx| Terminal::new_session_log(playback, cx));
+
+        Self::new_with_terminal(
+            TerminalViewInit {
+                terminal,
+                connection_id: None,
+                stored_connection: None,
+                sync_path_enabled: false,
+                local_working_dir: None,
+                tab_index: None,
+                duplicate_source: None,
+                recording_playback_name: None,
+                session_log_name: Some(display_name),
             },
             window,
             cx,
@@ -136,6 +165,38 @@ impl TerminalView {
                 tab_index,
                 duplicate_source: Some(duplicate_source),
                 recording_playback_name: None,
+                session_log_name: None,
+            },
+            window,
+            cx,
+        )
+    }
+
+    pub fn new_telnet(conn: StoredConnection, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_telnet_with_index(conn, None, window, cx)
+    }
+
+    pub fn new_telnet_with_index(
+        conn: StoredConnection,
+        tab_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let connection_id = conn.id;
+        let duplicate_source = TerminalDuplicateSource::Telnet(conn.clone());
+        let terminal = cx.new(|cx| Terminal::new_telnet(conn, cx));
+        // Telnet 不传 stored_connection，避免创建文件管理器面板
+        Self::new_with_terminal(
+            TerminalViewInit {
+                terminal,
+                connection_id,
+                stored_connection: None,
+                sync_path_enabled: true,
+                local_working_dir: None,
+                tab_index,
+                duplicate_source: Some(duplicate_source),
+                recording_playback_name: None,
+                session_log_name: None,
             },
             window,
             cx,

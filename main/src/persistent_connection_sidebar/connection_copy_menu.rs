@@ -94,6 +94,7 @@ fn copy_action_presentation(action: ConnectionCopyAction) -> (String, IconName) 
         ConnectionCopyAction::RemoteDesktopAddress => {
             label("copy_remote_desktop_target", IconName::Network)
         }
+        ConnectionCopyAction::TelnetAddress => label("copy_telnet_target", IconName::Network),
         ConnectionCopyAction::Username => label("copy_username", IconName::User),
         ConnectionCopyAction::SerialPort => label("copy_serial_port", IconName::Network),
         ConnectionCopyAction::ForwardingRule => label("copy_forwarding_rule", IconName::Network),
@@ -136,6 +137,12 @@ mod tests {
                 auth_method: SshAuthMethod::Password {
                     password: "secret".to_string(),
                 },
+                credential_reference: None,
+                prompt_username: None,
+                prompt_password: None,
+                keyboard_interactive: None,
+                terminal_encoding: Default::default(),
+                terminal_type: Default::default(),
                 connect_timeout: None,
                 keepalive_interval: None,
                 keepalive_max: None,
@@ -148,6 +155,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         )

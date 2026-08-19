@@ -6,6 +6,7 @@ mod broadcast_registry;
 pub mod cd_completion;
 pub mod highlight_presets;
 pub mod history_prompt;
+mod host_key_dialog;
 pub mod keys;
 pub mod public_mcp;
 pub mod public_mcp_remote_ops;
@@ -14,6 +15,7 @@ pub mod settings;
 pub mod sidebar;
 mod ssh_form_mfa;
 pub mod ssh_form_window;
+pub mod telnet_form_window;
 pub mod terminal_element;
 mod theme;
 pub mod view;
@@ -29,6 +31,7 @@ pub use settings::{
 };
 pub use sidebar::{SettingsPanel, SidebarPanel, TerminalSidebar, TerminalSidebarEvent};
 pub use ssh_form_window::{SshFormPostSaveAction, SshFormWindow, SshFormWindowConfig};
+pub use telnet_form_window::{TelnetFormWindow, TelnetFormWindowConfig};
 pub use terminal::terminal::{
     ConnectionState, SshTerminalConfig, Terminal, TerminalConnectionKind, TerminalModelEvent,
 };
@@ -36,5 +39,7 @@ pub use theme::{
     DEFAULT_LINE_HEIGHT_SCALE, MAX_FONT_SIZE, MIN_FONT_SIZE, TerminalColors, TerminalTheme,
     available_monospace_fonts, default_font_fallbacks,
 };
-pub use view::{RecordingPlaybackViewConfig, TerminalView, init, refresh_keybindings};
+pub use view::{
+    RecordingPlaybackViewConfig, SessionLogViewConfig, TerminalView, init, refresh_keybindings,
+};
 pub use workspace::TerminalWorkspace;

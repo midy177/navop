@@ -271,6 +271,12 @@ fn ssh_params() -> SshParams {
         port: 22,
         username: "app".to_string(),
         auth_method: SshAuthMethod::AutoPublicKey,
+        credential_reference: None,
+        prompt_username: None,
+        prompt_password: None,
+        keyboard_interactive: None,
+        terminal_encoding: Default::default(),
+        terminal_type: Default::default(),
         connect_timeout: None,
         keepalive_interval: None,
         keepalive_max: None,
@@ -283,6 +289,7 @@ fn ssh_params() -> SshParams {
         proxy: None,
         os_id: None,
         icon: None,
+        account_expect: Default::default(),
     }
 }
 
@@ -296,6 +303,7 @@ fn sqlite_config(path: impl Into<String>) -> DbConnectionConfig {
         port: 0,
         username: String::new(),
         password: String::new(),
+        credential_reference: None,
         database: None,
         service_name: None,
         sid: None,

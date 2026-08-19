@@ -852,6 +852,18 @@ Table:
     en: Backup Table
     zh-CN: 创建备份表
     zh-HK: 建立備份表
+  copy_table_name:
+    en: Copy Table Name
+    zh-CN: 复制表名
+    zh-HK: 複製表名
+  copy_table_comment:
+    en: Copy Comment
+    zh-CN: 复制注释
+    zh-HK: 複製註解
+  copy_success:
+    en: Copied to clipboard
+    zh-CN: 已复制到剪贴板
+    zh-HK: 已複製到剪貼簿
   truncate_table:
     en: Truncate Table
     zh-CN: 清空表
@@ -1107,6 +1119,26 @@ Procedure:
 
 # 查询操作
 Query:
+  select_connection:
+    en: Select connection...
+    zh-CN: 选择连接...
+    zh-HK: 選擇連線...
+  search_connection:
+    en: Search connections...
+    zh-CN: 搜索连接...
+    zh-HK: 搜尋連線...
+  connection_switch_during_execution:
+    en: Wait for the current query to finish before switching connections
+    zh-CN: 请等待当前查询执行完成后再切换连接
+    zh-HK: 請等待目前查詢執行完成後再切換連線
+  transaction_finish_before_switch_connection:
+    en: Commit or roll back the current transaction before switching connections
+    zh-CN: 请先提交或回滚当前事务，再切换连接
+    zh-HK: 請先提交或回滾目前交易，再切換連線
+  connection_unavailable:
+    en: The selected connection is unavailable
+    zh-CN: 所选连接当前不可用
+    zh-HK: 所選連線目前不可用
   compress:
     en: Compress
     zh-CN: 压缩
@@ -1215,6 +1247,22 @@ Query:
     en: Query Name
     zh-CN: 查询名称
     zh-HK: 查詢名稱
+  query_name_empty:
+    en: Query name cannot be empty
+    zh-CN: 查询名称不能为空
+    zh-HK: 查詢名稱不能為空
+  query_name_exists:
+    en: A query with this name already exists
+    zh-CN: 已存在同名查询
+    zh-HK: 已存在同名查詢
+  query_name_invalid:
+    en: Query name is not a valid file name
+    zh-CN: 查询名称不是有效的文件名
+    zh-HK: 查詢名稱不是有效的檔案名稱
+  query_save_failed:
+    en: "Failed to save query: %{error}"
+    zh-CN: "保存查询失败：%{error}"
+    zh-HK: "儲存查詢失敗：%{error}"
   query_saved:
     en: Query saved successfully
     zh-CN: 查询保存成功
@@ -1235,6 +1283,10 @@ Query:
     en: Running...
     zh-CN: 运行中...
     zh-HK: 執行中...
+  stop:
+    en: Stop
+    zh-CN: 停止
+    zh-HK: 停止
   run_selected:
     en: Run Selected
     zh-CN: 运行选中
@@ -1251,6 +1303,18 @@ Query:
     en: Save
     zh-CN: 保存
     zh-HK: 儲存
+  save_query_title:
+    en: Save Query
+    zh-CN: 保存查询
+    zh-HK: 儲存查詢
+  enter_query_name:
+    en: Enter a query name
+    zh-CN: 请输入查询名称
+    zh-HK: 請輸入查詢名稱
+  dont_save:
+    en: Don't Save
+    zh-CN: 不保存
+    zh-HK: 不儲存
   select_database:
     en: Select database...
     zh-CN: 选择数据库...
@@ -2309,11 +2373,11 @@ TableData:
   clone_row:
     en: Clone Row
     zh-CN: 克隆行
-    zh-HK: 複製列
+    zh-HK: 複製行
   clone_row_failed:
     en: Unable to clone this row
     zh-CN: 无法克隆该行
-    zh-HK: 無法複製此列
+    zh-HK: 無法複製此行
   delete_record:
     en: Delete Record...
     zh-CN: 删除记录...
@@ -2394,7 +2458,7 @@ TableDataGrid:
   edit_cell_title:
     en: "Edit Cell - %{column} (Row %{row})"
     zh-CN: "编辑单元格 - %{column} (行 %{row})"
-    zh-HK: "編輯儲存格 - %{column} (列 %{row})"
+    zh-HK: "編輯儲存格 - %{column} (行 %{row})"
   error_message:
     en: "Error: %{error}"
     zh-CN: "错误: %{error}"
@@ -2442,11 +2506,11 @@ TableDataGrid:
   add_row:
     en: Add Row
     zh-CN: 添加行
-    zh-HK: 新增列
+    zh-HK: 新增行
   delete_row:
     en: Delete Row
     zh-CN: 删除行
-    zh-HK: 刪除列
+    zh-HK: 刪除行
   undo:
     en: Undo
     zh-CN: 撤销
@@ -3285,6 +3349,14 @@ Compare:
     en: Tables
     zh-CN: 表
     zh-HK: 表
+  object_table:
+    en: Table
+    zh-CN: 表
+    zh-HK: 表
+  object_columns:
+    en: Columns
+    zh-CN: 列
+    zh-HK: 欄位
   object_indexes:
     en: Indexes
     zh-CN: 索引
@@ -3295,6 +3367,10 @@ Compare:
     zh-HK: 外鍵
   object_views:
     en: Views
+    zh-CN: 视图
+    zh-HK: 檢視
+  object_view:
+    en: View
     zh-CN: 视图
     zh-HK: 檢視
   object_routines:
@@ -3325,6 +3401,38 @@ Compare:
     en: Ignore comments
     zh-CN: 忽略注释
     zh-HK: 忽略註解
+  sync_column_order:
+    en: Preserve source column order in generated SQL
+    zh-CN: 生成 SQL 时保持源表列顺序
+    zh-HK: 產生 SQL 時保持來源表欄位順序
+  type_mapping_overrides:
+    en: Type Mapping Overrides
+    zh-CN: 类型映射覆盖
+    zh-HK: 類型映射覆蓋
+  add_type_mapping:
+    en: Add Type Mapping
+    zh-CN: 添加类型映射
+    zh-HK: 新增類型映射
+  source_type_placeholder:
+    en: Source Type
+    zh-CN: 源类型
+    zh-HK: 來源類型
+  target_database_placeholder:
+    en: Target Database
+    zh-CN: 目标数据库
+    zh-HK: 目標資料庫
+  target_type_placeholder:
+    en: Target Type
+    zh-CN: 目标类型
+    zh-HK: 目標類型
+  type_mapping_required_fields:
+    en: Source type and target type are required
+    zh-CN: 源类型和目标类型不能为空
+    zh-HK: 來源類型和目標類型不能為空
+  type_mapping_saved:
+    en: Type mapping saved
+    zh-CN: 类型映射已保存
+    zh-HK: 類型映射已保存
   swap_source_target:
     en: Swap source and target
     zh-CN: 交换源和目标
@@ -3361,14 +3469,70 @@ Compare:
     en: Data compare complete
     zh-CN: 数据比较完成
     zh-HK: 資料比較完成
+  data_compare_plan_failed:
+    en: "Data comparison completed, but the sync plan could not be generated. Compare results were preserved and execution is disabled: %{error}"
+    zh-CN: "数据比较已完成，但同步计划生成失败。比较结果已保留，并已禁止执行：%{error}"
+    zh-HK: "資料比較已完成，但同步計劃產生失敗。比較結果已保留，並已禁止執行：%{error}"
   data_compare_truncated_no_sql:
     en: Data compare result was truncated; sync SQL generation and execution are disabled.
     zh-CN: 数据比较结果已截断，已禁止生成和执行同步 SQL
     zh-HK: 資料比較結果已截斷，已禁止產生和執行同步 SQL
+  data_compare_missing_target_note:
+    en: At least one target table does not exist. CREATE TABLE statements were added to the sync plan before the INSERT statements.
+    zh-CN: 至少一个目标表不存在，同步计划已在 INSERT 前加入 CREATE TABLE 建表语句
+    zh-HK: 至少一個目標表不存在，同步計劃已在 INSERT 前加入 CREATE TABLE 建表語句
+  data_compare_table_failed_note:
+    en: "%{count} table(s) failed to compare and were excluded from the sync plan."
+    zh-CN: "%{count} 张表比较失败，已从同步计划中排除"
+    zh-HK: "%{count} 張表比較失敗，已從同步計劃中排除"
+  data_compare_dependency_metadata_failed_note:
+    en: Dependency metadata could not be loaded completely. Compare results were preserved, but sync SQL generation and execution are disabled because statement ordering cannot be guaranteed.
+    zh-CN: 依赖元数据未能完整加载。比较结果已保留，但由于无法保证同步语句顺序，已禁止生成和执行同步 SQL
+    zh-HK: 依賴中繼資料未能完整載入。比較結果已保留，但由於無法保證同步語句順序，已禁止產生和執行同步 SQL
+  data_compare_dependency_metadata_no_sql:
+    en: Dependency metadata is incomplete; sync SQL generation and execution are disabled.
+    zh-CN: 依赖元数据不完整，已禁止生成和执行同步 SQL
+    zh-HK: 依賴中繼資料不完整，已禁止產生和執行同步 SQL
+  data_compare_snapshot_unavailable_no_sql:
+    en: A consistent read snapshot was unavailable; sync SQL generation and execution are disabled.
+    zh-CN: 无法获得一致读快照，已禁止生成和执行同步 SQL
+    zh-HK: 無法取得一致讀取快照，已禁止產生和執行同步 SQL
+  data_diff_details:
+    en: Data Difference Details
+    zh-CN: 数据差异明细
+    zh-HK: 資料差異明細
+  data_diff_row_count:
+    en: "%{count} changed row(s)"
+    zh-CN: "%{count} 行有差异"
+    zh-HK: "%{count} 行有差異"
+  data_diff_no_changes:
+    en: No data differences
+    zh-CN: 没有数据差异
+    zh-HK: 沒有資料差異
+  data_diff_show_limit:
+    en: "Showing first %{count} rows per category"
+    zh-CN: "每类仅显示前 %{count} 行"
+    zh-HK: "每類僅顯示前 %{count} 行"
+  data_diff_direction:
+    en: "Direction: target current value → source desired value"
+    zh-CN: "变更方向：目标当前值 → 源端期望值"
+    zh-HK: "變更方向：目標目前值 → 來源端期望值"
   schema_compare_complete:
     en: Schema compare complete
     zh-CN: 结构比较完成
     zh-HK: 結構比較完成
+  schema_compare_plan_failed:
+    en: "Schema comparison completed, but the sync plan could not be generated. Compare results were preserved and execution is disabled: %{error}"
+    zh-CN: "结构比较已完成，但同步计划生成失败。比较结果已保留，并已禁止执行：%{error}"
+    zh-HK: "結構比較已完成，但同步計劃產生失敗。比較結果已保留，並已禁止執行：%{error}"
+  schema_compare_table_failed_note:
+    en: "%{count} table(s) failed to compare. The partial result was preserved, but sync SQL generation and execution are disabled."
+    zh-CN: "%{count} 张表结构比较失败。部分比较结果已保留，但已禁止生成和执行同步 SQL"
+    zh-HK: "%{count} 張表結構比較失敗。部分比較結果已保留，但已禁止產生和執行同步 SQL"
+  table_compare_failed:
+    en: "Table %{table} compare failed: %{error}"
+    zh-CN: "表 %{table} 比较失败：%{error}"
+    zh-HK: "資料表 %{table} 比較失敗：%{error}"
   compare_failed:
     en: "Compare failed: %{error}"
     zh-CN: "比较失败:%{error}"
@@ -3401,18 +3565,34 @@ Compare:
     en: "Reading %{side} table schema"
     zh-CN: "正在读取%{side}表结构"
     zh-HK: "正在讀取%{side}表結構"
+  loading_metadata:
+    en: Loading metadata
+    zh-CN: 正在加载元数据
+    zh-HK: 正在載入中繼資料
+  loading_metadata_for_table:
+    en: "Loading metadata for `%{table}`"
+    zh-CN: "正在加载表 `%{table}` 的元数据"
+    zh-HK: "正在載入資料表 `%{table}` 的中繼資料"
+  loading_dependency_metadata:
+    en: Loading table dependency metadata
+    zh-CN: 正在加载表依赖元数据
+    zh-HK: 正在載入資料表依賴中繼資料
+  loading_dependency_metadata_for_table:
+    en: "Loading dependency metadata for `%{table}`"
+    zh-CN: "正在加载表 `%{table}` 的依赖元数据"
+    zh-HK: "正在載入資料表 `%{table}` 的依賴中繼資料"
   data_truncated_both:
     en: Source and target data were truncated; only the first rows were compared.
     zh-CN: 源/目标数据均已截断,仅比较前若干行
-    zh-HK: 來源/目標資料均已截斷，僅比較前若干列
+    zh-HK: 來源/目標資料均已截斷，僅比較前若干行
   data_truncated_source:
     en: Source data was truncated; only the first rows were compared.
     zh-CN: 源数据已截断,仅比较前若干行
-    zh-HK: 來源資料已截斷，僅比較前若干列
+    zh-HK: 來源資料已截斷，僅比較前若干行
   data_truncated_target:
     en: Target data was truncated; only the first rows were compared.
     zh-CN: 目标数据已截断,仅比较前若干行
-    zh-HK: 目標資料已截斷，僅比較前若干列
+    zh-HK: 目標資料已截斷，僅比較前若干行
   added:
     en: Added
     zh-CN: 新增
@@ -3425,6 +3605,22 @@ Compare:
     en: Modified
     zh-CN: 修改
     zh-HK: 修改
+  schema_diff_details:
+    en: Difference Details
+    zh-CN: 差异明细
+    zh-HK: 差異明細
+  schema_diff_object_count:
+    en: "%{count} changed object(s)"
+    zh-CN: "%{count} 个对象有差异"
+    zh-HK: "%{count} 個物件有差異"
+  schema_diff_no_changes:
+    en: No schema differences
+    zh-CN: 没有结构差异
+    zh-HK: 沒有結構差異
+  schema_diff_direction:
+    en: "Changes are shown as target current value → source desired value."
+    zh-CN: "变更方向：目标当前值 → 源端期望值。"
+    zh-HK: "變更方向：目標目前值 → 來源端期望值。"
   sync_statements:
     en: Sync Statements
     zh-CN: 同步语句
@@ -3513,6 +3709,22 @@ Compare:
     en: Sync SQL
     zh-CN: 同步 SQL
     zh-HK: 同步 SQL
+  sync_sql_modified:
+    en: SQL was manually modified. Statement selection changes will not overwrite it.
+    zh-CN: SQL 已被手工修改，语句选择变化不会覆盖当前内容
+    zh-HK: SQL 已被手動修改，語句選擇變更不會覆蓋目前內容
+  restore_generated_sql:
+    en: Restore generated SQL
+    zh-CN: 恢复生成 SQL
+    zh-HK: 還原產生的 SQL
+  sync_sql_restored:
+    en: Generated SQL restored from the current statement selection
+    zh-CN: 已根据当前语句选择恢复生成 SQL
+    zh-HK: 已根據目前語句選擇還原產生的 SQL
+  sync_sql_restore_before_execute:
+    en: SQL was manually modified. Restore the generated SQL before executing the compare sync plan.
+    zh-CN: SQL 已被手工修改，请先恢复生成 SQL，再执行比较同步计划
+    zh-HK: SQL 已被手動修改，請先還原產生的 SQL，再執行比較同步計劃
   sync_sql_execution_log:
     en: SQL Execution Log
     zh-CN: SQL 执行日志
@@ -3541,6 +3753,10 @@ Compare:
     en: No sync SQL to execute
     zh-CN: 没有可执行的同步 SQL
     zh-HK: 沒有可執行的同步 SQL
+  sync_sql_plan_changed:
+    en: The sync plan has changed. Review the latest compare results and confirm the SQL again.
+    zh-CN: 同步计划已发生变化，请检查最新比较结果并重新确认执行内容
+    zh-HK: 同步計劃已發生變化，請檢查最新比較結果並重新確認執行內容
   sync_sql_executing:
     en: Executing sync SQL...
     zh-CN: 正在执行同步 SQL…
@@ -3579,3 +3795,59 @@ DatabaseSidebar:
     en: AI Chat
     zh-CN: AI 对话
     zh-HK: AI 對話
+  execution_history:
+    en: Execution History
+    zh-CN: 执行记录
+    zh-HK: 執行記錄
+  query_succeeded:
+    en: Query succeeded
+    zh-CN: 查询成功
+    zh-HK: 查詢成功
+  execution_succeeded:
+    en: Execution succeeded
+    zh-CN: 执行成功
+    zh-HK: 執行成功
+  execution_history_count:
+    en: "%{count} records"
+    zh-CN: "%{count} 条"
+    zh-HK: "%{count} 條"
+  no_execution_history:
+    en: No execution records yet
+    zh-CN: 暂无执行记录
+    zh-HK: 暫無執行記錄
+  clear_execution_history:
+    en: Clear execution history
+    zh-CN: 清空执行记录
+    zh-HK: 清空執行記錄
+  filter_all:
+    en: "All (%{count})"
+    zh-CN: "全部（%{count}）"
+    zh-HK: "全部（%{count}）"
+  filter_success:
+    en: "Success (%{count})"
+    zh-CN: "成功（%{count}）"
+    zh-HK: "成功（%{count}）"
+  filter_failed:
+    en: "Failed (%{count})"
+    zh-CN: "失败（%{count}）"
+    zh-HK: "失敗（%{count}）"
+  affected_rows:
+    en: "%{count} rows affected"
+    zh-CN: "影响 %{count} 行"
+    zh-HK: "影響 %{count} 行"
+  returned_rows:
+    en: "%{count} rows returned"
+    zh-CN: "返回 %{count} 行"
+    zh-HK: "返回 %{count} 行"
+  execution_time:
+    en: "%{duration}ms"
+    zh-CN: "%{duration}ms"
+    zh-HK: "%{duration}ms"
+  server_result:
+    en: Server Result
+    zh-CN: 服务器返回
+    zh-HK: 伺服器回傳
+  executed_sql:
+    en: Executed SQL
+    zh-CN: 执行 SQL
+    zh-HK: 執行 SQL

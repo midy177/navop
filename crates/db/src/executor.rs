@@ -62,7 +62,7 @@ pub(crate) fn apply_query_max_rows(
     max_rows: Option<usize>,
     is_query: bool,
 ) -> Cow<'_, str> {
-    let Some(max_rows) = max_rows else {
+    let Some(max_rows) = max_rows.filter(|rows| *rows > 0) else {
         return Cow::Borrowed(sql);
     };
     let Some(tokens) = simple_select_tokens(&db_type, sql) else {
@@ -74,9 +74,10 @@ pub(crate) fn apply_query_max_rows(
 
     match db_type {
         DatabaseType::MSSQL => apply_mssql_top(sql, max_rows, &tokens),
-        DatabaseType::Oracle => {
-            append_query_clause(sql, &format!("FETCH FIRST {max_rows} ROWS ONLY"))
-        }
+        // Oracle result limits are enforced while fetching rows from OCI.
+        // Rewriting here would break pre-12c servers and can alter valid SQL
+        // such as statements containing FOR UPDATE, comments, or complex CTEs.
+        DatabaseType::Oracle => Cow::Borrowed(sql),
         _ => append_query_clause(sql, &format!("LIMIT {max_rows}")),
     }
 }
@@ -221,6 +222,17 @@ impl SqlResult {
     pub fn is_error(&self) -> bool {
         matches!(self, SqlResult::Error(_))
     }
+
+    /// Restore the parser-provided statement as result metadata after execution-time rewriting.
+    pub fn with_original_sql(mut self, sql: impl Into<String>) -> Self {
+        let sql = sql.into();
+        match &mut self {
+            SqlResult::Query(result) => result.sql = sql,
+            SqlResult::Exec(result) => result.sql = sql,
+            SqlResult::Error(result) => result.sql = sql,
+        }
+        self
+    }
 }
 
 /// Column metadata for query results
@@ -362,10 +374,13 @@ mod tests {
     }
 
     #[test]
-    fn query_max_rows_adds_oracle_fetch() {
-        let sql =
-            apply_query_max_rows(DatabaseType::Oracle, "select * from users;", Some(25), true);
-        assert_eq!("select * from users FETCH FIRST 25 ROWS ONLY;", sql);
+    fn query_max_rows_keeps_oracle_sql_unchanged() {
+        for sql in ["select * from users", "select * from users;"] {
+            assert_eq!(
+                sql,
+                apply_query_max_rows(DatabaseType::Oracle, sql, Some(25), true)
+            );
+        }
     }
 
     #[test]
@@ -382,6 +397,10 @@ mod tests {
         assert_eq!(
             "select * from users",
             apply_query_max_rows(DatabaseType::MySQL, "select * from users", None, true)
+        );
+        assert_eq!(
+            "select * from users",
+            apply_query_max_rows(DatabaseType::MySQL, "select * from users", Some(0), true)
         );
         assert_eq!(
             "show tables",
@@ -432,6 +451,42 @@ mod tests {
             serde_json::from_str(&encoded).expect("binary cell should deserialize");
 
         assert_eq!(decoded, cell);
+    }
+
+    #[test]
+    fn sql_result_restores_original_statement_sql() {
+        let original_sql = "select * from users";
+        let rewritten_sql = "select * from users LIMIT 1000";
+        let results = [
+            SqlResult::Query(QueryResult {
+                sql: rewritten_sql.to_string(),
+                columns: vec![],
+                column_meta: vec![],
+                rows: vec![],
+                binary_cells: vec![],
+                elapsed_ms: 0,
+            }),
+            SqlResult::Exec(ExecResult {
+                sql: rewritten_sql.to_string(),
+                rows_affected: 0,
+                elapsed_ms: 0,
+                message: None,
+            }),
+            SqlResult::Error(SqlErrorInfo {
+                sql: rewritten_sql.to_string(),
+                message: "failure".to_string(),
+            }),
+        ];
+
+        for result in results {
+            let result = result.with_original_sql(original_sql);
+            let actual_sql = match result {
+                SqlResult::Query(result) => result.sql,
+                SqlResult::Exec(result) => result.sql,
+                SqlResult::Error(result) => result.sql,
+            };
+            assert_eq!(original_sql, actual_sql);
+        }
     }
 }
 

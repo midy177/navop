@@ -53,16 +53,17 @@ impl HostRenderKey {
 
 fn color_key(color: Hsla) -> [u32; 4] {
     [
-        color.h.to_bits(),
-        color.s.to_bits(),
-        color.l.to_bits(),
-        color.a.to_bits(),
+        color.hue.into_degrees().to_bits(),
+        color.saturation.to_bits(),
+        color.lightness.to_bits(),
+        color.alpha.to_bits(),
     ]
 }
 
-pub(crate) struct HostRenderedArtifact {
-    pub(crate) artifact: Arc<BlockRenderArtifact>,
-    pub(crate) image: Arc<Image>,
+#[derive(Clone, Debug)]
+pub struct HostRenderedArtifact {
+    pub artifact: Arc<BlockRenderArtifact>,
+    pub image: Arc<Image>,
 }
 
 enum HostRenderState {

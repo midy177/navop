@@ -122,6 +122,12 @@ fn to_ssh_connection(
         port: required_port(&draft.port)?,
         username: draft.username.trim().to_string(),
         auth_method: edited_ssh_auth_method(draft, &imported.auth_method)?,
+        credential_reference: None,
+        prompt_username: None,
+        prompt_password: None,
+        keyboard_interactive: None,
+        terminal_encoding: Default::default(),
+        terminal_type: Default::default(),
         connect_timeout: None,
         keepalive_interval: None,
         keepalive_max: None,
@@ -134,6 +140,7 @@ fn to_ssh_connection(
         proxy: None,
         os_id: None,
         icon: None,
+        account_expect: Default::default(),
     };
     Ok(StoredConnection::new_ssh(name, params, None))
 }

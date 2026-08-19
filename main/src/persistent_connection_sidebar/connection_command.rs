@@ -410,6 +410,7 @@ mod tests {
             port: 5432,
             username: "db-user".to_string(),
             password: "db-secret".to_string(),
+            credential_reference: None,
             database: Some("app".to_string()),
             service_name: None,
             sid: None,
@@ -425,6 +426,12 @@ mod tests {
             port: 2222,
             username: "alice doe".to_string(),
             auth_method,
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            keyboard_interactive: None,
+            terminal_encoding: Default::default(),
+            terminal_type: Default::default(),
             connect_timeout: None,
             keepalive_interval: None,
             keepalive_max: None,
@@ -440,10 +447,12 @@ mod tests {
                 auth_method: SshAuthMethod::Password {
                     password: "jump-secret".to_string(),
                 },
+                credential_reference: None,
             }),
             proxy: None,
             os_id: None,
             icon: None,
+            account_expect: Default::default(),
         }
     }
 
@@ -555,6 +564,7 @@ mod tests {
             port: 6380,
             password: Some("redis-secret".to_string()),
             username: Some("redis-user".to_string()),
+            credential_reference: None,
             db_index: 2,
             mode: RedisMode::Standalone,
             use_tls: true,
@@ -584,6 +594,7 @@ mod tests {
             master_name: "mymaster".to_string(),
             sentinels: vec!["redis-1:26379".to_string()],
             sentinel_password: Some("sentinel-secret".to_string()),
+            credential_reference: None,
         });
         assert_eq!(None, redis_uri(&params));
         assert_eq!(None, redis_command(&params));
@@ -612,6 +623,7 @@ mod tests {
             port: 6379,
             password: Some("redis-secret".to_string()),
             username: Some("redis-user".to_string()),
+            credential_reference: None,
             db_index: 0,
             mode: RedisMode::Sentinel,
             use_tls: false,
@@ -620,6 +632,7 @@ mod tests {
                 master_name: String::new(),
                 sentinels: vec!["redis-1:26379".to_string()],
                 sentinel_password: Some("sentinel-secret".to_string()),
+                credential_reference: None,
             }),
             cluster: None,
             ssh_tunnel: None,
@@ -656,6 +669,7 @@ mod tests {
             database: None,
             username: Some("admin".to_string()),
             password: Some("structured-secret".to_string()),
+            credential_reference: None,
             auth_source: None,
             replica_set: None,
             read_preference: None,
@@ -692,6 +706,7 @@ mod tests {
             database: Some("app data".to_string()),
             username: Some("admin".to_string()),
             password: Some("secret".to_string()),
+            credential_reference: None,
             auth_source: Some("admin".to_string()),
             replica_set: Some("rs 0".to_string()),
             read_preference: Some("secondaryPreferred".to_string()),

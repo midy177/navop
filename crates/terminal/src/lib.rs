@@ -1,3 +1,4 @@
+pub mod encoding;
 pub(crate) mod exec_capture;
 pub(crate) mod exec_supervisor;
 pub mod history;
@@ -9,14 +10,22 @@ pub mod pty_backend;
 pub mod recording;
 pub mod serial_backend;
 mod serial_ingress;
+mod session_logging;
 pub mod shell_integration;
 pub mod ssh_backend;
+mod ssh_expect;
 mod ssh_ingress;
 mod ssh_session_identity;
+pub mod telnet_backend;
+mod telnet_expect;
+mod telnet_ingress;
 pub mod terminal;
 pub mod types;
 #[cfg(any(test, target_os = "windows"))]
+mod windows_environment;
+#[cfg(any(test, target_os = "windows"))]
 mod windows_shell_integration;
+pub mod zmodem;
 
 pub use exec_supervisor::TerminalExecError;
 pub use local_shell::{
@@ -34,6 +43,7 @@ pub use ssh_backend::SshBackend;
 pub use ssh_session_identity::{
     PersistedSshSessionIdentity, PersistedSshSessionIdentityError, SshSessionIdentityTransition,
 };
+pub use telnet_backend::TelnetBackend;
 pub use terminal::{TerminalScrollProxy, TerminalSessionMode, TerminalTextSnapshot};
 pub use types::{
     LocalConfig, TerminalBackend, TerminalControlAction, TerminalControlError,
@@ -42,6 +52,8 @@ pub use types::{
     TerminalExecProgress, TerminalExecRequest, TerminalInputHandle, TerminalSize,
 };
 
+#[cfg(test)]
+mod encoding_tests;
 #[cfg(test)]
 mod ingress_queue_tests;
 #[cfg(test)]

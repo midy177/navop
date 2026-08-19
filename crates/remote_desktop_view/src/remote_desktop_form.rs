@@ -1,27 +1,38 @@
+mod backend_preference;
 mod connection_test;
 mod inputs;
 mod persistence;
 mod proxy;
 mod selects;
+#[cfg(test)]
+mod tests;
 mod view;
 
+use connection_form::credential::{
+    CredentialCapabilities, CredentialPickerConfig, CredentialPickerEvent,
+    CredentialReferencePicker, create_credential_picker,
+};
 use connection_form::team::{
     TeamSelectItem, create_team_select, refresh_team_options, resolve_team_assignment,
     selected_team_id,
 };
-use gpui::{App, Context, Entity, FocusHandle, Window};
+use gpui::{App, Context, Entity, FocusHandle, Subscription, Window};
 use gpui_component::input::InputState;
 use gpui_component::select::SelectState;
 use one_core::cloud_sync::TeamOption;
 use one_core::storage::{
-    ProxyType, RemoteDesktopParams, RemoteDesktopProtocol, StoredConnection, Workspace,
+    ProxyType, RdpAudioMode, RdpSettings, RemoteDesktopParams, RemoteDesktopProtocol,
+    StoredConnection, Workspace,
 };
 use rust_i18n::t;
 
 use self::connection_test::ConnectionTestState;
 use self::inputs::{create_inputs, input_text, non_empty_text, parse_u16};
 use self::persistence::{emit_saved_connection, persist_connection};
-use self::selects::{WorkspaceSelectItem, create_workspace_select};
+use self::selects::{
+    BackendPreferenceSelectItem, WorkspaceSelectItem, create_backend_preference_select,
+    create_workspace_select,
+};
 
 pub struct RemoteDesktopFormWindowConfig {
     pub protocol: RemoteDesktopProtocol,
@@ -43,20 +54,29 @@ pub struct RemoteDesktopFormWindow {
     port_input: Entity<InputState>,
     username_input: Entity<InputState>,
     password_input: Entity<InputState>,
+    credential_picker: Entity<CredentialReferencePicker>,
     domain_input: Entity<InputState>,
     proxy_host_input: Entity<InputState>,
     proxy_port_input: Entity<InputState>,
     proxy_username_input: Entity<InputState>,
     proxy_password_input: Entity<InputState>,
+    proxy_credential_picker: Entity<CredentialReferencePicker>,
     workspace_select: Entity<SelectState<Vec<WorkspaceSelectItem>>>,
     team_select: Entity<SelectState<Vec<TeamSelectItem>>>,
+    backend_preference_select: Entity<SelectState<Vec<BackendPreferenceSelectItem>>>,
     read_only: bool,
     audio_playback: bool,
+    // Persisted RDP settings from the edited connection. Kept verbatim unless
+    // the user explicitly changes a control backed by these settings, so
+    // editing an existing connection does not wipe its native RDP
+    // configuration.
+    rdp_settings: Option<RdpSettings>,
     proxy_enabled: bool,
     proxy_type: ProxyType,
     sync_enabled: bool,
     connection_test: ConnectionTestState,
     error: Option<String>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl RemoteDesktopFormWindow {
@@ -79,6 +99,46 @@ impl RemoteDesktopFormWindow {
         let is_editing = config.editing_connection.is_some();
         let inputs = create_inputs(config.protocol, window, cx);
         let editing_connection = config.editing_connection.clone();
+        let editing_params = config
+            .editing_connection
+            .as_ref()
+            .and_then(|connection| connection.to_remote_desktop_params().ok());
+        let credential_picker = create_credential_picker(
+            CredentialPickerConfig::new(
+                "remote-desktop-credential",
+                CredentialCapabilities::login(),
+            )
+            .reference(
+                editing_params
+                    .as_ref()
+                    .and_then(|params| params.credential_reference.clone()),
+            ),
+            window,
+            cx,
+        );
+        let proxy_credential_picker = create_credential_picker(
+            CredentialPickerConfig::new(
+                "remote-desktop-proxy-credential",
+                CredentialCapabilities::login(),
+            )
+            .reference(
+                editing_params
+                    .as_ref()
+                    .and_then(|params| params.proxy.as_ref())
+                    .and_then(|proxy| proxy.credential_reference.clone()),
+            ),
+            window,
+            cx,
+        );
+        let subscriptions = vec![
+            cx.subscribe(&credential_picker, |_, _, _: &CredentialPickerEvent, cx| {
+                cx.notify()
+            }),
+            cx.subscribe(
+                &proxy_credential_picker,
+                |_, _, _: &CredentialPickerEvent, cx| cx.notify(),
+            ),
+        ];
         Self {
             protocol: config.protocol,
             focus_handle: cx.focus_handle(),
@@ -98,15 +158,19 @@ impl RemoteDesktopFormWindow {
             port_input: inputs.port,
             username_input: inputs.username,
             password_input: inputs.password,
+            credential_picker,
             domain_input: inputs.domain,
             proxy_host_input: inputs.proxy_host,
             proxy_port_input: inputs.proxy_port,
             proxy_username_input: inputs.proxy_username,
             proxy_password_input: inputs.proxy_password,
+            proxy_credential_picker,
             workspace_select: create_workspace_select(&config, window, cx),
             team_select: create_team_select(&config.teams, None, window, cx),
+            backend_preference_select: create_backend_preference_select(window, cx),
             read_only: false,
             audio_playback: false,
+            rdp_settings: None,
             proxy_enabled: false,
             proxy_type: ProxyType::Socks5,
             sync_enabled: config
@@ -116,6 +180,7 @@ impl RemoteDesktopFormWindow {
                 .unwrap_or(true),
             connection_test: ConnectionTestState::default(),
             error: None,
+            _subscriptions: subscriptions,
         }
     }
 
@@ -147,6 +212,9 @@ impl RemoteDesktopFormWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.credential_picker.update(cx, |picker, cx| {
+            picker.set_reference(params.credential_reference, window, cx)
+        });
         let host = params.host;
         let username = params.username.unwrap_or_default();
         let password = params.password.unwrap_or_default();
@@ -163,7 +231,16 @@ impl RemoteDesktopFormWindow {
         self.domain_input
             .update(cx, |state, cx| state.set_value(&domain, window, cx));
         self.read_only = params.read_only;
-        self.audio_playback = audio_playback_for_protocol(self.protocol, params.audio_playback);
+        self.rdp_settings = params.rdp;
+        self.audio_playback = match self.rdp_settings.as_ref() {
+            Some(settings) if self.protocol == RemoteDesktopProtocol::Rdp => {
+                settings.audio.mode == RdpAudioMode::Local
+            }
+            _ => audio_playback_for_protocol(self.protocol, params.audio_playback),
+        };
+        self.backend_preference_select.update(cx, |state, cx| {
+            state.set_selected_value(&params.backend_preference, window, cx)
+        });
         self.apply_proxy(params.proxy, window, cx);
     }
 
@@ -180,8 +257,17 @@ impl RemoteDesktopFormWindow {
             &input_text(&self.proxy_port_input, cx),
             &input_text(&self.proxy_username_input, cx),
             &input_text(&self.proxy_password_input, cx),
+            self.proxy_credential_picker.read(cx).selected_reference(),
         )
         .map_err(proxy::proxy_error_message)?;
+        let audio_playback = if self.protocol == RemoteDesktopProtocol::Rdp {
+            self.rdp_settings
+                .as_ref()
+                .map(|settings| settings.audio.mode == RdpAudioMode::Local)
+                .unwrap_or(self.audio_playback)
+        } else {
+            false
+        };
         Ok(RemoteDesktopParams {
             protocol: self.protocol,
             host,
@@ -190,8 +276,19 @@ impl RemoteDesktopFormWindow {
             password: non_empty_text(&self.password_input, cx),
             domain: non_empty_text(&self.domain_input, cx),
             read_only: self.read_only,
-            audio_playback: audio_playback_for_protocol(self.protocol, self.audio_playback),
+            audio_playback,
             proxy,
+            credential_reference: self.credential_picker.read(cx).selected_reference(),
+            backend_preference: self
+                .backend_preference_select
+                .read(cx)
+                .selected_value()
+                .copied()
+                .unwrap_or_default(),
+            // Preserve loaded RDP settings (including non-binary audio modes)
+            // unless the corresponding form control changed them. Switching
+            // to VNC clears them.
+            rdp: rdp_settings_for_protocol(self.protocol, self.rdp_settings.clone()),
         })
     }
 
@@ -274,25 +371,12 @@ fn audio_playback_for_protocol(protocol: RemoteDesktopProtocol, enabled: bool) -
     protocol == RemoteDesktopProtocol::Rdp && enabled
 }
 
-#[cfg(test)]
-mod tests {
-    use one_core::storage::RemoteDesktopProtocol;
-
-    use super::audio_playback_for_protocol;
-
-    #[test]
-    fn audio_playback_is_only_enabled_for_rdp() {
-        assert!(audio_playback_for_protocol(
-            RemoteDesktopProtocol::Rdp,
-            true
-        ));
-        assert!(!audio_playback_for_protocol(
-            RemoteDesktopProtocol::Vnc,
-            true
-        ));
-        assert!(!audio_playback_for_protocol(
-            RemoteDesktopProtocol::Rdp,
-            false
-        ));
+fn rdp_settings_for_protocol(
+    protocol: RemoteDesktopProtocol,
+    settings: Option<RdpSettings>,
+) -> Option<RdpSettings> {
+    match protocol {
+        RemoteDesktopProtocol::Rdp => settings,
+        _ => None,
     }
 }

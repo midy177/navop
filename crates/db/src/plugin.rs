@@ -30,6 +30,95 @@ use std::collections::HashMap;
 use std::io;
 use tracing::log::error;
 
+pub(crate) fn parse_table_data_total_count(result: SqlResult) -> Result<usize> {
+    let query_result = match result {
+        SqlResult::Query(query_result) => query_result,
+        SqlResult::Exec(_) => bail!("table row count query returned an execution result"),
+        SqlResult::Error(error) => bail!(error.message),
+    };
+    let value = query_result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .ok_or_else(|| anyhow!("table row count query returned no scalar value"))?
+        .as_deref()
+        .ok_or_else(|| anyhow!("table row count query returned NULL"))?;
+    value
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| anyhow!("invalid table row count `{value}`: {error}"))
+}
+
+/// A complete paginated query together with any result columns used only to implement pagination.
+///
+/// Most databases only append a pagination clause and therefore have no hidden columns. Databases
+/// such as Oracle 11g need to wrap the base query and expose an internal `ROWNUM` column while
+/// applying an offset. Callers must pass the returned [`QueryResult`] through
+/// [`PaginatedQuery::strip_hidden_result_columns`] before displaying or exporting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaginatedQuery {
+    pub sql: String,
+    hidden_result_columns: Vec<String>,
+}
+
+impl PaginatedQuery {
+    pub fn new(sql: impl Into<String>) -> Self {
+        Self {
+            sql: sql.into(),
+            hidden_result_columns: Vec::new(),
+        }
+    }
+
+    pub fn with_hidden_result_column(mut self, column: impl Into<String>) -> Self {
+        self.hidden_result_columns.push(column.into());
+        self
+    }
+
+    pub fn strip_hidden_result_columns(&self, query_result: &mut QueryResult) -> Result<()> {
+        if self.hidden_result_columns.is_empty() {
+            return Ok(());
+        }
+
+        let column_count = query_result.columns.len();
+        anyhow::ensure!(
+            query_result.column_meta.is_empty() || query_result.column_meta.len() == column_count,
+            "pagination result column metadata is inconsistent"
+        );
+        for row in &query_result.rows {
+            anyhow::ensure!(
+                row.len() == column_count,
+                "pagination result row has an inconsistent column count"
+            );
+        }
+
+        for hidden_column in self.hidden_result_columns.iter().rev() {
+            let column_index = query_result
+                .columns
+                .iter()
+                .rposition(|column| column.eq_ignore_ascii_case(hidden_column))
+                .ok_or_else(|| anyhow!("pagination result column `{hidden_column}` is missing"))?;
+
+            query_result.columns.remove(column_index);
+            if !query_result.column_meta.is_empty() {
+                query_result.column_meta.remove(column_index);
+            }
+            for row in &mut query_result.rows {
+                row.remove(column_index);
+            }
+            query_result
+                .binary_cells
+                .retain(|cell| cell.column_index != column_index);
+            for cell in &mut query_result.binary_cells {
+                if cell.column_index > column_index {
+                    cell.column_index -= 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Standard SQL functions common to most databases
 pub const STANDARD_SQL_FUNCTIONS: &[(&str, &str)] = &[
     // String functions
@@ -278,6 +367,14 @@ pub trait DatabasePlugin: Send + Sync {
     /// Get the rowid column name for this database
     fn rowid_column_name(&self) -> &'static str {
         "rowid"
+    }
+
+    /// Get the alias used for the synthetic rowid projection in table-data
+    /// queries. External drivers may override this when their manifest uses a
+    /// custom alias; compare consumers must use the same value when removing
+    /// the projection from query results.
+    fn rowid_column_alias(&self) -> &str {
+        "__rowid__"
     }
 
     /// Get the SQL dialect for this database type
@@ -708,6 +805,16 @@ pub trait DatabasePlugin: Send + Sync {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<Vec<TriggerInfo>>;
+
+    async fn list_triggers_in_schema(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+        schema: Option<String>,
+    ) -> Result<Vec<TriggerInfo>> {
+        let _ = schema;
+        self.list_triggers(connection, database).await
+    }
 
     async fn list_triggers_view(
         &self,
@@ -1540,6 +1647,9 @@ pub trait DatabasePlugin: Send + Sync {
                             let mut m = folder_metadata.clone();
                             m.insert("columns".to_string(), fk.columns.join(", "));
                             m.insert("ref_table".to_string(), fk.ref_table.clone());
+                            if let Some(schema) = fk.ref_schema.as_deref() {
+                                m.insert("ref_schema".to_string(), schema.to_string());
+                            }
                             m.insert("ref_columns".to_string(), fk.ref_columns.join(", "));
                             m
                         })
@@ -1718,6 +1828,9 @@ pub trait DatabasePlugin: Send + Sync {
                         let mut meta = node.metadata.clone();
                         meta.insert("columns".to_string(), fk.columns.join(", "));
                         meta.insert("ref_table".to_string(), fk.ref_table.clone());
+                        if let Some(schema) = fk.ref_schema.as_deref() {
+                            meta.insert("ref_schema".to_string(), schema.to_string());
+                        }
                         meta.insert("ref_columns".to_string(), fk.ref_columns.join(", "));
                         DbNode::new(
                             format!("{}:{}", id, fk.name),
@@ -1787,6 +1900,25 @@ pub trait DatabasePlugin: Send + Sync {
         format!(" LIMIT {} OFFSET {}", limit, offset)
     }
 
+    /// Build a complete paginated query.
+    ///
+    /// The default implementation preserves the existing suffix-based pagination behavior.
+    /// Implementations that cannot express pagination as a SQL suffix (for example Oracle 11g)
+    /// should override this method and wrap `base_sql`.
+    fn build_paginated_query(
+        &self,
+        base_sql: &str,
+        limit: usize,
+        offset: usize,
+        order_clause: &str,
+    ) -> PaginatedQuery {
+        PaginatedQuery::new(format!(
+            "{}{}",
+            base_sql,
+            self.format_pagination(limit, offset, order_clause)
+        ))
+    }
+
     /// Format table reference for queries. Override for databases with different syntax.
     /// - MySQL: `database`.`table`
     /// - PostgreSQL: "schema"."table" (uses schema, ignores database since connection is db-specific)
@@ -1834,8 +1966,7 @@ pub trait DatabasePlugin: Send + Sync {
             _ => String::new(),
         };
 
-        // Calculate offset
-        let offset = (request.page.saturating_sub(1)) * request.page_size;
+        let offset = request.effective_offset();
 
         // Build table reference
         let table_ref = self.format_table_reference(
@@ -1844,43 +1975,38 @@ pub trait DatabasePlugin: Send + Sync {
             &request.table,
         );
 
-        // Build count query
-        let count_sql = format!("SELECT COUNT(*) FROM {}{}", table_ref, where_clause);
-
-        // Get total count
-        let total_count = match connection.query(&count_sql).await? {
-            SqlResult::Query(result) => result
-                .rows
-                .first()
-                .and_then(|r| r.first())
-                .and_then(|v| v.as_ref())
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0),
-            _ => 0,
+        let total_count = match request.known_total_count {
+            Some(total_count) => total_count,
+            None => {
+                let count_sql = format!("SELECT COUNT(*) FROM {}{}", table_ref, where_clause);
+                parse_table_data_total_count(connection.query(&count_sql).await?)?
+            }
         };
 
         // Query with pagination, include rowid if supported
-        let pagination = self.format_pagination(request.page_size, offset, &order_clause);
-        let data_sql = if self.supports_rowid() {
+        let base_sql = if self.supports_rowid() {
             let rowid_col = self.rowid_column_name();
             format!(
-                "SELECT {} AS __rowid__, t.* FROM {} t{}{}{}",
-                rowid_col, table_ref, where_clause, order_clause, pagination
+                "SELECT {} AS __rowid__, t.* FROM {} t{}{}",
+                rowid_col, table_ref, where_clause, order_clause
             )
         } else {
             format!(
-                "SELECT * FROM {}{}{}{}",
-                table_ref, where_clause, order_clause, pagination
+                "SELECT * FROM {}{}{}",
+                table_ref, where_clause, order_clause
             )
         };
-        let sql_result = connection.query(&data_sql).await?;
+        let paginated_query =
+            self.build_paginated_query(&base_sql, request.page_size, offset, &order_clause);
+        let sql_result = connection.query(&paginated_query.sql).await?;
         let duration = start_time.elapsed().as_millis();
 
-        let query_result = match sql_result {
+        let mut query_result = match sql_result {
             SqlResult::Query(query_result) => Ok::<QueryResult, Error>(query_result),
             SqlResult::Exec(_) => bail!(t!("Error.query_type_error")),
             SqlResult::Error(sql_error_info) => bail!(sql_error_info.message),
         }?;
+        paginated_query.strip_hidden_result_columns(&mut query_result)?;
 
         Ok(TableDataResponse {
             query_result,
@@ -2138,6 +2264,15 @@ pub trait DatabasePlugin: Send + Sync {
     /// Format binary value (database-specific, can be overridden)
     fn format_binary_value(&self, v: &str) -> String {
         self.escape_copy_string(v)
+    }
+
+    /// Format exact binary bytes as a database-specific SQL expression.
+    ///
+    /// This is intentionally separate from [`DatabasePlugin::format_binary_value`], which receives
+    /// a display string used by copy SQL. Import/export callers with lossless bytes should use this
+    /// method instead of trying to infer binary values from their display representation.
+    fn format_binary_literal(&self, bytes: &[u8]) -> String {
+        format_binary_literal_for_database(&self.name(), bytes)
     }
 
     /// Escape string for copy SQL (database-specific, can be overridden)
@@ -2440,23 +2575,28 @@ pub trait DatabasePlugin: Send + Sync {
         limit: Option<usize>,
     ) -> Result<String> {
         let table_ref = self.format_table_reference(database, schema, table);
-        let mut select_sql = format!("SELECT * FROM {}", table_ref);
+        let mut base_sql = format!("SELECT * FROM {}", table_ref);
         if let Some(where_c) = where_clause {
-            select_sql.push_str(" WHERE ");
-            select_sql.push_str(where_c);
+            base_sql.push_str(" WHERE ");
+            base_sql.push_str(where_c);
         }
-        if let Some(lim) = limit {
-            let pagination = self.format_pagination(lim, 0, "");
-            select_sql.push_str(&pagination);
-        }
+        let paginated_query =
+            limit.map(|limit| self.build_paginated_query(&base_sql, limit, 0, ""));
+        let select_sql = paginated_query
+            .as_ref()
+            .map(|query| query.sql.as_str())
+            .unwrap_or(base_sql.as_str());
 
         let result = connection
-            .query(&select_sql)
+            .query(select_sql)
             .await
             .map_err(|e| anyhow::anyhow!("Query failed: {}", e))?;
 
         let mut output = String::new();
-        if let SqlResult::Query(query_result) = result {
+        if let SqlResult::Query(mut query_result) = result {
+            if let Some(paginated_query) = &paginated_query {
+                paginated_query.strip_hidden_result_columns(&mut query_result)?;
+            }
             if !query_result.rows.is_empty() {
                 let table_ident = self.format_export_table_reference(database, schema, table);
                 for row in &query_result.rows {
@@ -2671,11 +2811,19 @@ pub trait DatabasePlugin: Send + Sync {
             .map(|column| self.quote_identifier(column))
             .collect::<Vec<_>>()
             .join(", ");
+        let referenced_table = match foreign_key.ref_schema.as_deref() {
+            Some(schema) if !schema.trim().is_empty() => format!(
+                "{}.{}",
+                self.quote_identifier(schema),
+                self.quote_identifier(&foreign_key.ref_table)
+            ),
+            _ => self.quote_identifier(&foreign_key.ref_table),
+        };
         let mut definition = format!(
             "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
             self.quote_identifier(&foreign_key.name),
             columns,
-            self.quote_identifier(&foreign_key.ref_table),
+            referenced_table,
             ref_columns
         );
         if let Some(action) = foreign_key_action_sql(&foreign_key.on_delete) {
@@ -2695,6 +2843,7 @@ pub trait DatabasePlugin: Send + Sync {
     ) -> bool {
         left.columns != right.columns
             || left.ref_table != right.ref_table
+            || left.ref_schema != right.ref_schema
             || left.ref_columns != right.ref_columns
             || foreign_key_action_sql(&left.on_delete) != foreign_key_action_sql(&right.on_delete)
             || foreign_key_action_sql(&left.on_update) != foreign_key_action_sql(&right.on_update)
@@ -2909,6 +3058,23 @@ fn foreign_key_action_sql(action: &str) -> Option<String> {
     match action.as_str() {
         "CASCADE" | "RESTRICT" | "NO ACTION" | "SET NULL" | "SET DEFAULT" => Some(action),
         _ => None,
+    }
+}
+
+pub(crate) fn format_binary_literal_for_database(
+    database_type: &DatabaseType,
+    bytes: &[u8],
+) -> String {
+    let hex = hex::encode(bytes);
+    match database_type {
+        DatabaseType::PostgreSQL => format!("decode('{hex}', 'hex')"),
+        DatabaseType::MSSQL => format!("0x{hex}"),
+        DatabaseType::Oracle => format!("HEXTORAW('{hex}')"),
+        DatabaseType::DuckDB => format!("from_hex('{hex}')"),
+        DatabaseType::ClickHouse => format!("unhex('{hex}')"),
+        DatabaseType::MySQL | DatabaseType::SQLite | DatabaseType::External { .. } => {
+            format!("X'{hex}'")
+        }
     }
 }
 
@@ -3284,6 +3450,7 @@ pub fn analyze_select_editability_fallback(sql: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::{ExecResult, SqlErrorInfo};
     use crate::mysql::MySqlPlugin;
     use sqlparser::dialect::MySqlDialect;
     use sqlparser::parser::Parser;
@@ -3324,6 +3491,66 @@ mod tests {
         assert!(plugin.capabilities().supports_functions);
 
         assert_eq!(" LIMIT 10 OFFSET 20", plugin.format_pagination(10, 20, ""));
+    }
+
+    #[test]
+    fn table_data_total_count_requires_a_scalar_integer_query_result() {
+        let valid = SqlResult::Query(QueryResult {
+            sql: "SELECT COUNT(*)".to_string(),
+            columns: vec!["count".to_string()],
+            column_meta: vec![],
+            rows: vec![vec![Some(" 42 ".to_string())]],
+            binary_cells: vec![],
+            elapsed_ms: 0,
+        });
+        assert_eq!(42, parse_table_data_total_count(valid).unwrap());
+
+        let missing = SqlResult::Query(QueryResult {
+            sql: "SELECT COUNT(*)".to_string(),
+            columns: vec!["count".to_string()],
+            column_meta: vec![],
+            rows: vec![],
+            binary_cells: vec![],
+            elapsed_ms: 0,
+        });
+        assert!(parse_table_data_total_count(missing).is_err());
+
+        let null = SqlResult::Query(QueryResult {
+            sql: "SELECT COUNT(*)".to_string(),
+            columns: vec!["count".to_string()],
+            column_meta: vec![],
+            rows: vec![vec![None]],
+            binary_cells: vec![],
+            elapsed_ms: 0,
+        });
+        assert!(parse_table_data_total_count(null).is_err());
+
+        let invalid = SqlResult::Query(QueryResult {
+            sql: "SELECT COUNT(*)".to_string(),
+            columns: vec!["count".to_string()],
+            column_meta: vec![],
+            rows: vec![vec![Some("many".to_string())]],
+            binary_cells: vec![],
+            elapsed_ms: 0,
+        });
+        assert!(parse_table_data_total_count(invalid).is_err());
+
+        let exec = SqlResult::Exec(ExecResult {
+            sql: "SELECT COUNT(*)".to_string(),
+            rows_affected: 0,
+            elapsed_ms: 0,
+            message: None,
+        });
+        assert!(parse_table_data_total_count(exec).is_err());
+
+        let error = SqlResult::Error(SqlErrorInfo {
+            sql: "SELECT COUNT(*)".to_string(),
+            message: "count failed".to_string(),
+        });
+        assert_eq!(
+            "count failed",
+            parse_table_data_total_count(error).unwrap_err().to_string()
+        );
     }
 
     #[test]

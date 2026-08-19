@@ -4,17 +4,18 @@ use gpui::{
     Radians, Render, RenderOnce, SharedString, StyleRefinement, Styled, Svg, Transformation,
     Window, div, img, prelude::FluentBuilder as _, svg,
 };
+use palette::IntoColor;
 // use gpui_component_macros::icon_named;
 use std::path::PathBuf;
 
 mod metadata;
 mod size;
-mod typed;
+mod wrappers;
 
 pub use metadata::{IconKind, IconMetadata};
 pub use size::IconSize;
 use size::{resolve_icon_size, should_apply_resolved_size};
-pub use typed::{BrandIcon, FunctionalIcon, IconKindMismatch, ObjectIcon};
+pub use wrappers::{BrandIcon, FunctionalIcon, ObjectIcon};
 
 /// Types implementing this trait can automatically be converted to [`Icon`].
 ///
@@ -90,6 +91,7 @@ pub enum IconName {
     Eye,
     EyeOff,
     File,
+    Json,
     MarkdownColor,
     RichTextColor,
     Unarchive,
@@ -112,6 +114,7 @@ pub enum IconName {
     Info,
     Inspector,
     LayoutDashboard,
+    ListChecks,
     Loader,
     LoaderCircle,
     LocateActiveTab,
@@ -314,6 +317,7 @@ impl IconName {
         Self::Eye,
         Self::EyeOff,
         Self::File,
+        Self::Json,
         Self::MarkdownColor,
         Self::RichTextColor,
         Self::Unarchive,
@@ -336,6 +340,7 @@ impl IconName {
         Self::Info,
         Self::Inspector,
         Self::LayoutDashboard,
+        Self::ListChecks,
         Self::Loader,
         Self::LoaderCircle,
         Self::LocateActiveTab,
@@ -554,6 +559,7 @@ impl IconNamed for IconName {
             Self::Eye => "icons/eye.svg",
             Self::EyeOff => "icons/eye-off.svg",
             Self::File => "icons/file.svg",
+            Self::Json => "icons/json.svg",
             Self::MarkdownColor => "icons/markdown_color.svg",
             Self::RichTextColor => "icons/rich_text_color.svg",
             Self::Unarchive => "icons/unarchive.svg",
@@ -576,6 +582,7 @@ impl IconNamed for IconName {
             Self::Info => "icons/info.svg",
             Self::Inspector => "icons/inspector.svg",
             Self::LayoutDashboard => "icons/layout-dashboard.svg",
+            Self::ListChecks => "icons/list-checks.svg",
             Self::Loader => "icons/loader.svg",
             Self::LoaderCircle => "icons/loader-circle.svg",
             Self::LocateActiveTab => "icons/locate-active-tab.svg",
@@ -859,8 +866,8 @@ impl Styled for Icon {
         &mut self.style
     }
 
-    fn text_color(mut self, color: impl Into<Hsla>) -> Self {
-        self.text_color = Some(color.into());
+    fn text_color(mut self, color: impl IntoColor<Hsla>) -> Self {
+        self.text_color = Some(color.into_color());
         self
     }
 }

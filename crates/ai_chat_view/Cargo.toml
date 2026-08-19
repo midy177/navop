@@ -4,6 +4,10 @@ version = "0.1.0"
 publish.workspace = true
 edition.workspace = true
 
+[features]
+default = ["embedded-webview"]
+embedded-webview = ["dep:gpui-wry", "dep:wry"]
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
@@ -13,8 +17,6 @@ gpui-component.workspace = true
 one-core.workspace = true
 agent_runtime = { path = "../agent_runtime" }
 html-preview.workspace = true
-gpui-wry = { path = "../webview" }
-wry = { version = "0.53.3", package = "lb-wry" }
 agent-client-protocol.workspace = true
 llm-connector = { workspace = true, features = ["streaming"] }
 async-trait.workspace = true
@@ -28,9 +30,12 @@ image.workspace = true
 uuid.workspace = true
 lsp-types.workspace = true
 sum-tree.workspace = true
+gpui-wry = { path = "../webview", optional = true }
+wry = { version = "0.53.3", package = "lb-wry", optional = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+palette.workspace = true
 
 [[bin]]
 name = "fake_acp_agent"

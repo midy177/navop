@@ -8,7 +8,7 @@
 //! [`AgentComposerContext`],注入模型 / 工具执行模式的下拉选项,并处理输入框
 //! emit 的选择事件(目标轮换、模型 / 模式切换)。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,7 +42,7 @@ use one_core::llm::{GlobalProviderState, LlmConnector, LlmProvider, ProviderConf
 use one_core::settings::{AiChatToolExecutionMode, AppSettings};
 use one_core::sidebar_contribution::SidebarPlacement;
 use rust_i18n::t;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::acp::{
     AcpAgentEntry, AcpConnectOutcome, AcpConnection, AcpConnectionPhase, AcpError, AcpErrorKind,
@@ -93,6 +93,38 @@ pub enum AgentChatViewEvent {
 /// 根据模型选项构建对应运行时。
 pub type AgentRuntimeFactory =
     Arc<dyn Fn(&ComposerModelOption) -> anyhow::Result<Arc<Runtime>> + Send + Sync + 'static>;
+
+const MAX_CACHED_SESSION_TRANSCRIPTS: usize = 32;
+const MAX_RUNTIME_EVENT_BATCH_SIZE: usize = 64;
+
+fn runtime_event_matches_session(event: &RuntimeEvent, session_filter: Option<&SessionId>) -> bool {
+    session_filter.is_none_or(|session_id| event.session_id() == session_id)
+}
+
+fn collect_ready_runtime_events(
+    rx: &mut RuntimeEventReceiver,
+    first: RuntimeEvent,
+    session_filter: Option<&SessionId>,
+) -> Vec<RuntimeEvent> {
+    let mut events = Vec::new();
+    if runtime_event_matches_session(&first, session_filter) {
+        events.push(first);
+    }
+
+    for _ in events.len()..MAX_RUNTIME_EVENT_BATCH_SIZE {
+        match rx.try_recv() {
+            Ok(event) if runtime_event_matches_session(&event, session_filter) => {
+                if events.len() == 1 {
+                    events.reserve(MAX_RUNTIME_EVENT_BATCH_SIZE - 1);
+                }
+                events.push(event);
+            }
+            Ok(_) | Err(TryRecvError::Lagged(_)) => {}
+            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+        }
+    }
+    events
+}
 
 /// 当前驱动后端:自研内核(One_Agent)或外部 ACP agent。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -750,6 +782,8 @@ pub struct AgentChatView {
     live_sessions: Vec<SessionSummary>,
     /// 非当前会话的实时转录，切换回来时可继续看到流式进度。
     session_transcripts: HashMap<String, AgentTranscript>,
+    /// 非当前会话转录的 LRU 顺序，队首为最久未访问项。
+    session_transcript_order: VecDeque<String>,
     /// 当前 Runtime 中仍在执行的会话集合。
     running_sessions: HashSet<String>,
     /// 本地 stop 后不再允许影响后续轮次状态的旧 turn。
@@ -1001,6 +1035,7 @@ impl AgentChatView {
             sessions,
             live_sessions,
             session_transcripts: HashMap::new(),
+            session_transcript_order: VecDeque::new(),
             running_sessions,
             ignored_local_turns: HashSet::new(),
             local_operation_generations: HashMap::new(),
@@ -1325,24 +1360,34 @@ impl AgentChatView {
         cx.spawn(async move |this, cx| {
             loop {
                 match rx.recv().await {
-                    Ok(event)
-                        if session_filter
-                            .as_ref()
-                            .map_or(true, |session_id| event.session_id() == session_id) =>
-                    {
+                    Ok(event) => {
+                        let events =
+                            collect_ready_runtime_events(&mut rx, event, session_filter.as_ref());
+                        if events.is_empty() {
+                            continue;
+                        }
                         if this
-                            .update(cx, |this, cx| this.apply_runtime_event(event, cx))
+                            .update(cx, |this, cx| this.apply_runtime_events(events, cx))
                             .is_err()
                         {
                             break;
                         }
                     }
-                    Ok(_) => {}
                     Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => break,
                 }
             }
         })
+    }
+
+    fn apply_runtime_events(&mut self, events: Vec<RuntimeEvent>, cx: &mut Context<Self>) {
+        for event in events {
+            self.apply_runtime_event_with_deferred_budget(event, cx);
+        }
+        self.transcript.flush_deferred_budget();
+        for transcript in self.session_transcripts.values_mut() {
+            transcript.flush_deferred_budget();
+        }
     }
 
     fn on_input_event(
@@ -1497,6 +1542,7 @@ impl AgentChatView {
             match self.start_submission(session_uid, &submission, cx) {
                 SubmissionStart::Started => {
                     self.pending_submissions.pop_front(session_uid);
+                    self.trim_session_transcripts();
                     if session_uid == self.current_session {
                         self.sync_pending_preview(cx);
                     }
@@ -1510,6 +1556,7 @@ impl AgentChatView {
                 }
                 SubmissionStart::Rejected => {
                     self.pending_submissions.pop_front(session_uid);
+                    self.trim_session_transcripts();
                     if session_uid == self.current_session {
                         self.sync_pending_preview(cx);
                     }
@@ -1741,6 +1788,9 @@ impl AgentChatView {
         let input = UserInput::new(submission.text.clone()).with_images(input_images);
         let operation_generation = self.next_local_operation_generation(session_uid);
         self.set_session_running(session_uid, true, cx);
+        self.runtime
+            .services()
+            .set_agent_max_iterations(AppSettings::current(cx).ai_chat.max_iterations);
 
         let runtime = self.runtime.clone();
         let tool_mode = self.tool_execution_mode;
@@ -1847,16 +1897,20 @@ impl AgentChatView {
             self.transcript.push_user(text, image_count);
             return;
         }
-        let transcript = self
-            .session_transcripts
-            .entry(session_uid.to_string())
-            .or_insert_with(|| {
-                let mut transcript = AgentTranscript::new();
-                transcript.set_resource_context(resources);
-                transcript
-            });
-        transcript.set_resource_context(resources);
-        transcript.push_user(text, image_count);
+        {
+            let transcript = self
+                .session_transcripts
+                .entry(session_uid.to_string())
+                .or_insert_with(|| {
+                    let mut transcript = AgentTranscript::new();
+                    transcript.set_resource_context(resources);
+                    transcript
+                });
+            transcript.set_resource_context(resources);
+            transcript.push_user(text, image_count);
+        }
+        self.touch_session_transcript(session_uid);
+        self.trim_session_transcripts();
     }
 
     fn request_acp_cancel_for_session(&mut self, session_uid: &str) -> bool {
@@ -2032,7 +2086,25 @@ impl AgentChatView {
         cx.notify();
     }
 
+    #[cfg(test)]
     fn apply_runtime_event(&mut self, event: RuntimeEvent, cx: &mut Context<Self>) {
+        self.apply_runtime_event_inner(event, false, cx);
+    }
+
+    fn apply_runtime_event_with_deferred_budget(
+        &mut self,
+        event: RuntimeEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_runtime_event_inner(event, true, cx);
+    }
+
+    fn apply_runtime_event_inner(
+        &mut self,
+        event: RuntimeEvent,
+        defer_budget: bool,
+        cx: &mut Context<Self>,
+    ) {
         let backend = self.backend;
         if backend == Backend::Local {
             let turn_id = runtime_event_turn_id(&event).clone();
@@ -2086,6 +2158,7 @@ impl AgentChatView {
                 self.cancel_pending_acp_permissions(cx);
                 self.set_session_running(&session_uid, false, cx);
                 self.acp_turn_owner = None;
+                self.trim_session_transcripts();
                 if acp_connection_is_unavailable(acp_terminal_phase.as_ref()) {
                     self.invalidate_unavailable_acp_connection(cx);
                 }
@@ -2112,21 +2185,33 @@ impl AgentChatView {
             _ => None,
         };
         let resources = self.resources.clone();
-        let transcript = if is_current_session {
-            &mut self.transcript
+        let applied = if is_current_session {
+            self.transcript.set_budget_deferred(defer_budget);
+            if let Some(error) = acp_error.as_ref() {
+                self.transcript.apply_acp_failure(&event, error)
+            } else {
+                self.transcript.apply(&event)
+            }
         } else {
-            self.session_transcripts
-                .entry(session_uid.clone())
-                .or_insert_with(|| {
-                    let mut transcript = AgentTranscript::new();
-                    transcript.set_resource_context(&resources);
-                    transcript
-                })
-        };
-        let applied = if let Some(error) = acp_error.as_ref() {
-            transcript.apply_acp_failure(&event, error)
-        } else {
-            transcript.apply(&event)
+            let applied = {
+                let transcript = self
+                    .session_transcripts
+                    .entry(session_uid.clone())
+                    .or_insert_with(|| {
+                        let mut transcript = AgentTranscript::new();
+                        transcript.set_resource_context(&resources);
+                        transcript
+                    });
+                transcript.set_budget_deferred(defer_budget);
+                if let Some(error) = acp_error.as_ref() {
+                    transcript.apply_acp_failure(&event, error)
+                } else {
+                    transcript.apply(&event)
+                }
+            };
+            self.touch_session_transcript(&session_uid);
+            self.trim_session_transcripts();
+            applied
         };
         if !applied {
             return;
@@ -2146,6 +2231,7 @@ impl AgentChatView {
             self.set_session_running(&session_uid, false, cx);
             if backend == Backend::Acp && is_real_terminal {
                 self.acp_turn_owner = None;
+                self.trim_session_transcripts();
             }
         }
         if backend == Backend::Acp
@@ -2207,6 +2293,11 @@ impl AgentChatView {
         self.scroll_handle.scroll_to_bottom();
     }
 
+    fn request_scroll_to_bottom_until_layout_settles(&mut self) {
+        self.auto_scroll.request_settle();
+        self.scroll_handle.scroll_to_bottom();
+    }
+
     fn set_running(&mut self, running: bool, cx: &mut Context<Self>) {
         let session_uid = self.current_session.clone();
         self.set_session_running(&session_uid, running, cx);
@@ -2238,6 +2329,7 @@ impl AgentChatView {
 
     fn next_acp_operation(&mut self) -> AcpOperationToken {
         self.acp_session_transition = None;
+        self.trim_session_transcripts();
         self.acp_operation_generation = self.acp_operation_generation.wrapping_add(1);
         if self.acp_operation_generation == 0 {
             self.acp_operation_generation = 1;
@@ -2341,6 +2433,7 @@ impl AgentChatView {
             .is_some_and(|transition| transition.operation == operation)
         {
             self.acp_session_transition = None;
+            self.trim_session_transcripts();
         }
     }
 
@@ -2349,6 +2442,7 @@ impl AgentChatView {
             self.running_sessions.insert(session_uid.to_string());
         } else {
             self.running_sessions.remove(session_uid);
+            self.trim_session_transcripts();
         }
         if session_uid == self.current_session {
             self.is_running = running;
@@ -2366,10 +2460,14 @@ impl AgentChatView {
         if session_uid == self.current_session {
             self.transcript.push_system(message);
         } else {
-            self.session_transcripts
-                .entry(session_uid.to_string())
-                .or_default()
-                .push_system(message);
+            {
+                self.session_transcripts
+                    .entry(session_uid.to_string())
+                    .or_default()
+                    .push_system(message);
+            }
+            self.touch_session_transcript(session_uid);
+            self.trim_session_transcripts();
         }
     }
 
@@ -2383,16 +2481,18 @@ impl AgentChatView {
         if session_uid == self.current_session {
             return Some(&mut self.transcript);
         }
-        let resources = self.resources.clone();
-        Some(
+        if !self.session_transcripts.contains_key(session_uid) {
+            let mut transcript = AgentTranscript::new();
+            transcript.set_resource_context(&self.resources);
             self.session_transcripts
-                .entry(session_uid.to_string())
-                .or_insert_with(|| {
-                    let mut transcript = AgentTranscript::new();
-                    transcript.set_resource_context(&resources);
-                    transcript
-                }),
-        )
+                .insert(session_uid.to_string(), transcript);
+        }
+        self.touch_session_transcript(session_uid);
+        self.trim_session_transcripts_to_preserving(
+            MAX_CACHED_SESSION_TRANSCRIPTS,
+            Some(session_uid),
+        );
+        self.session_transcripts.get_mut(session_uid)
     }
 
     /// 重建并把展示上下文推给输入框。
@@ -2532,7 +2632,7 @@ impl AgentChatView {
                 self.sync_session_skills();
                 self.selected_model = binding.selected_model;
                 self.current_session = self.session_id.to_string();
-                self.session_transcripts.clear();
+                self.clear_cached_session_transcripts();
                 self.live_sessions.clear();
                 self.ignored_local_turns.clear();
                 self.closed_sessions.clear();
@@ -2634,6 +2734,7 @@ impl AgentChatView {
                 self.pending_submissions.clear_session(&session_uid);
             }
             self.acp_turn_owner = None;
+            self.trim_session_transcripts();
             self.sync_pending_preview(cx);
             let operation =
                 self.begin_acp_session_transition(agent_id.clone(), session_uid.clone());
@@ -2731,6 +2832,7 @@ impl AgentChatView {
         self.sync_session_skills();
         self.current_session = self.session_id.to_string();
         self.closed_sessions.remove(&self.current_session);
+        self.trim_session_transcripts();
         self.transcript = AgentTranscript::new();
         self.transcript.set_resource_context(&self.resources);
         self.is_running = false;
@@ -2813,6 +2915,73 @@ impl AgentChatView {
             .insert(0, SessionSummary::new(uid, title, updated_at));
     }
 
+    fn touch_session_transcript(&mut self, uid: &str) {
+        if !self.session_transcripts.contains_key(uid) {
+            return;
+        }
+        self.session_transcript_order.retain(|item| item != uid);
+        self.session_transcript_order.push_back(uid.to_string());
+    }
+
+    fn cache_session_transcript(&mut self, uid: String, transcript: AgentTranscript) {
+        self.session_transcripts.insert(uid.clone(), transcript);
+        self.touch_session_transcript(&uid);
+        self.trim_session_transcripts();
+    }
+
+    fn remove_cached_session_transcript(&mut self, uid: &str) -> Option<AgentTranscript> {
+        self.session_transcript_order.retain(|item| item != uid);
+        self.session_transcripts.remove(uid)
+    }
+
+    fn clear_cached_session_transcripts(&mut self) {
+        self.session_transcripts.clear();
+        self.session_transcript_order.clear();
+    }
+
+    fn session_transcript_is_protected(&self, uid: &str) -> bool {
+        uid == self.current_session
+            || self.running_sessions.contains(uid)
+            || self.pending_submissions.len(uid) > 0
+            || self
+                .acp_turn_owner
+                .as_ref()
+                .is_some_and(|owner| owner.session_uid == uid)
+            || self
+                .acp_session_transition
+                .as_ref()
+                .is_some_and(|transition| transition.session_uid == uid)
+    }
+
+    fn trim_session_transcripts(&mut self) {
+        self.trim_session_transcripts_to(MAX_CACHED_SESSION_TRANSCRIPTS);
+    }
+
+    fn trim_session_transcripts_to(&mut self, max_entries: usize) {
+        self.trim_session_transcripts_to_preserving(max_entries, None);
+    }
+
+    fn trim_session_transcripts_to_preserving(
+        &mut self,
+        max_entries: usize,
+        preserve_uid: Option<&str>,
+    ) {
+        while self.session_transcripts.len() > max_entries {
+            let Some(index) = self.session_transcript_order.iter().position(|uid| {
+                preserve_uid != Some(uid.as_str())
+                    && self.session_transcripts.contains_key(uid)
+                    && !self.session_transcript_is_protected(uid)
+            }) else {
+                break;
+            };
+            let uid = self
+                .session_transcript_order
+                .remove(index)
+                .expect("session transcript LRU index must remain valid");
+            self.session_transcripts.remove(&uid);
+        }
+    }
+
     fn stash_current_transcript(&mut self) {
         if self.backend != Backend::Local {
             return;
@@ -2820,8 +2989,7 @@ impl AgentChatView {
         let mut replacement = AgentTranscript::new();
         replacement.set_resource_context(&self.resources);
         let transcript = std::mem::replace(&mut self.transcript, replacement);
-        self.session_transcripts
-            .insert(self.current_session.clone(), transcript);
+        self.cache_session_transcript(self.current_session.clone(), transcript);
     }
 
     fn discard_live_session(&mut self, uid: &str) {
@@ -2847,7 +3015,7 @@ impl AgentChatView {
         }
         self.runtime.close_session(&session_id);
         self.pending_submissions.remove_session(uid);
-        self.session_transcripts.remove(uid);
+        self.remove_cached_session_transcript(uid);
         self.live_sessions.retain(|summary| summary.id != uid);
     }
 
@@ -2871,7 +3039,8 @@ impl AgentChatView {
             session
         } else {
             let Some(snapshot) = persistence::load_snapshot(cx, uid) else {
-                if let Some(transcript) = self.session_transcripts.remove(&self.current_session) {
+                let current_session = self.current_session.clone();
+                if let Some(transcript) = self.remove_cached_session_transcript(&current_session) {
                     self.transcript = transcript;
                 }
                 self.reload_sessions(cx);
@@ -2886,7 +3055,7 @@ impl AgentChatView {
         self.session_id = target.id().clone();
         self.system_instruction = target.system_instruction();
         self.current_session = self.session_id.to_string();
-        if let Some(transcript) = self.session_transcripts.remove(uid) {
+        if let Some(transcript) = self.remove_cached_session_transcript(uid) {
             self.transcript = transcript;
         } else {
             let snapshot = target.snapshot();
@@ -2894,6 +3063,7 @@ impl AgentChatView {
                 .load_history(&snapshot.history, snapshot.plan.as_ref());
             self.transcript.set_resource_context(&self.resources);
         }
+        self.trim_session_transcripts();
         self.is_running = self.running_sessions.contains(uid);
         self.input
             .update(cx, |input, cx| input.set_running(self.is_running, cx));
@@ -3147,6 +3317,11 @@ impl AgentChatView {
             input.set_target_options(target_options, cx);
             input.set_context(ctx, cx);
         });
+        if self.sidebar_mode {
+            self.request_scroll_to_bottom_until_layout_settles();
+        } else {
+            self.request_scroll_to_bottom();
+        }
         cx.notify();
     }
 
@@ -3662,7 +3837,7 @@ impl Render for AgentChatView {
             .w_full()
             .min_w_0()
             .when(self.sidebar_mode, |this| {
-                this.min_h_0().flex_shrink(1.0).overflow_y_scroll()
+                this.min_h_0().flex_shrink_1().overflow_y_scroll()
             })
             .when(!self.sidebar_mode, |this| {
                 this.flex_shrink_0().overflow_hidden()
@@ -4637,6 +4812,7 @@ mod tests {
         point, px,
     };
     use one_core::llm::{ProviderConfig, ProviderType};
+    use palette::IntoColor as _;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4676,6 +4852,66 @@ mod tests {
             mentions: Vec::new(),
             images: Vec::new(),
         }
+    }
+
+    #[test]
+    fn runtime_event_batch_drains_only_the_bounded_ready_prefix() {
+        let (tx, mut rx) =
+            tokio::sync::broadcast::channel(MAX_RUNTIME_EVENT_BATCH_SIZE.saturating_add(2));
+        let session_id = SessionId::from_string("batch-session");
+        let turn_id = TurnId::from_string("batch-turn");
+
+        for index in 0..=MAX_RUNTIME_EVENT_BATCH_SIZE {
+            tx.send(RuntimeEvent::AssistantMessageDelta {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                delta: index.to_string(),
+            })
+            .unwrap();
+        }
+
+        let first = rx.try_recv().unwrap();
+        let events = collect_ready_runtime_events(&mut rx, first, None);
+
+        assert_eq!(MAX_RUNTIME_EVENT_BATCH_SIZE, events.len());
+        assert!(
+            rx.try_recv().is_ok(),
+            "batch must leave the overflow queued"
+        );
+    }
+
+    #[test]
+    fn runtime_event_batch_filters_other_sessions_without_reordering_matches() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let target_session = SessionId::from_string("target-session");
+        let other_session = SessionId::from_string("other-session");
+        let turn_id = TurnId::from_string("batch-turn");
+
+        for (session_id, delta) in [
+            (target_session.clone(), "first"),
+            (other_session, "ignored"),
+            (target_session.clone(), "second"),
+        ] {
+            tx.send(RuntimeEvent::AssistantMessageDelta {
+                session_id,
+                turn_id: turn_id.clone(),
+                delta: delta.into(),
+            })
+            .unwrap();
+        }
+
+        let first = rx.try_recv().unwrap();
+        let events = collect_ready_runtime_events(&mut rx, first, Some(&target_session));
+        let deltas = events
+            .into_iter()
+            .map(|event| match event {
+                RuntimeEvent::AssistantMessageDelta { delta, .. } => delta,
+                _ => unreachable!("test only sends assistant deltas"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(vec!["first", "second"], deltas);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
@@ -4885,6 +5121,116 @@ mod tests {
     }
 
     #[gpui::test]
+    fn cached_session_transcripts_evict_oldest_idle_entry(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, _| {
+            for index in 0..=MAX_CACHED_SESSION_TRANSCRIPTS {
+                view.cache_session_transcript(format!("cached-{index}"), AgentTranscript::new());
+            }
+
+            assert_eq!(
+                MAX_CACHED_SESSION_TRANSCRIPTS,
+                view.session_transcripts.len()
+            );
+            assert!(!view.session_transcripts.contains_key("cached-0"));
+            assert!(
+                view.session_transcripts
+                    .contains_key(&format!("cached-{MAX_CACHED_SESSION_TRANSCRIPTS}"))
+            );
+            assert!(
+                !view.closed_sessions.contains("cached-0"),
+                "cache eviction must not create a closed-session tombstone"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn cached_session_transcripts_preserve_active_sessions_until_release(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, _| {
+            let running_uid = "cached-running".to_string();
+            let pending_uid = "cached-pending".to_string();
+            let owner_uid = "cached-owner".to_string();
+            let transition_uid = "cached-transition".to_string();
+            let idle_uid = "cached-idle".to_string();
+
+            for uid in [
+                &running_uid,
+                &pending_uid,
+                &owner_uid,
+                &transition_uid,
+                &idle_uid,
+            ] {
+                view.cache_session_transcript(uid.clone(), AgentTranscript::new());
+            }
+            view.running_sessions.insert(running_uid.clone());
+            view.pending_submissions
+                .enqueue(&pending_uid, pending_submission("queued"));
+            view.acp_turn_owner = Some(AcpTurnOwner {
+                event_session_id: SessionId::from_string("acp:cached-owner"),
+                session_uid: owner_uid.clone(),
+                turn_id: TurnId::from_string("turn-cached-owner"),
+                cancel_requested: false,
+            });
+            view.acp_session_transition = Some(AcpSessionTransition {
+                operation: AcpOperationToken(1),
+                agent_id: "cached-agent".into(),
+                session_uid: transition_uid.clone(),
+                phase: AcpSessionTransitionPhase::Creating,
+            });
+
+            view.trim_session_transcripts_to(1);
+
+            assert_eq!(4, view.session_transcripts.len());
+            assert!(view.session_transcripts.contains_key(&running_uid));
+            assert!(view.session_transcripts.contains_key(&pending_uid));
+            assert!(view.session_transcripts.contains_key(&owner_uid));
+            assert!(view.session_transcripts.contains_key(&transition_uid));
+            assert!(!view.session_transcripts.contains_key(&idle_uid));
+
+            view.running_sessions.remove(&running_uid);
+            view.pending_submissions.remove_session(&pending_uid);
+            view.acp_turn_owner = None;
+            view.acp_session_transition = None;
+            view.trim_session_transcripts_to(1);
+
+            assert_eq!(1, view.session_transcripts.len());
+            assert!(view.session_transcripts.contains_key(&transition_uid));
+        });
+    }
+
+    #[gpui::test]
+    fn cached_session_transcript_access_refreshes_recency(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, _| {
+            view.cache_session_transcript("cached-a".into(), AgentTranscript::new());
+            view.cache_session_transcript("cached-b".into(), AgentTranscript::new());
+            view.touch_session_transcript("cached-a");
+            view.cache_session_transcript("cached-c".into(), AgentTranscript::new());
+            view.trim_session_transcripts_to(2);
+
+            assert!(view.session_transcripts.contains_key("cached-a"));
+            assert!(!view.session_transcripts.contains_key("cached-b"));
+            assert!(view.session_transcripts.contains_key("cached-c"));
+        });
+    }
+
+    #[gpui::test]
     fn acp_connecting_keeps_pending_submission_for_retry(cx: &mut TestAppContext) {
         init_test_ui(cx);
         let config =
@@ -5038,6 +5384,41 @@ mod tests {
             assert!(state.take_pending_for_render());
         }
         assert!(!state.take_pending_for_render());
+    }
+
+    #[gpui::test]
+    fn resource_context_change_requests_scroll_to_latest_message(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            let resource = ResourceRef::new("db-b", ResourceKind::Mysql, "secondary-db");
+            let resources = ResourceContext::new().with_resource(resource.clone());
+
+            assert_eq!(0, view.auto_scroll.pending_bottom_scroll_frames);
+            view.set_resource_context_with_catalog(resources, Vec::new(), vec![resource], cx);
+            assert_eq!(2, view.auto_scroll.pending_bottom_scroll_frames);
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_resource_context_change_scrolls_until_layout_settles(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![])
+            .sidebar_mode(true);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            let resource = ResourceRef::new("db-b", ResourceKind::Mysql, "secondary-db");
+            let resources = ResourceContext::new().with_resource(resource.clone());
+
+            assert_eq!(0, view.auto_scroll.pending_bottom_scroll_frames);
+            view.set_resource_context_with_catalog(resources, Vec::new(), vec![resource], cx);
+            assert_eq!(5, view.auto_scroll.pending_bottom_scroll_frames);
+        });
     }
 
     #[test]
@@ -8187,14 +8568,14 @@ mod tests {
 
     #[test]
     fn background_running_session_uses_readable_foreground_color() {
-        let foreground = gpui::rgb(0xf8fafc).into();
-        let selected_foreground = gpui::rgb(0xe2e8f0).into();
+        let foreground = gpui::rgb(0xf8fafc).into_color();
+        let selected_foreground = gpui::rgb(0xe2e8f0).into_color();
         let style = SessionRowStyle {
             foreground,
-            muted_foreground: gpui::rgb(0x64748b).into(),
-            selected_background: gpui::rgb(0x1e293b).into(),
+            muted_foreground: gpui::rgb(0x64748b).into_color(),
+            selected_background: gpui::rgb(0x1e293b).into_color(),
             selected_foreground,
-            hover_background: gpui::rgb(0x0f172a).into(),
+            hover_background: gpui::rgb(0x0f172a).into_color(),
         };
 
         assert_eq!(

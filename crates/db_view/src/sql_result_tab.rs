@@ -1,7 +1,7 @@
 // 2. 外部 crate 导入（按字母顺序）
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -25,14 +25,19 @@ use one_ui::edit_table::Column;
 use smol::Timer;
 use tracing::log::error;
 
+use crate::sidebar::execution_history::ExecutionContext;
+use crate::sidebar::execution_history_panel::ExecutionHistoryPanel;
 use crate::table_data::cell_preview_host::CellPreviewHost;
 use crate::table_data::data_grid::{DataGrid, DataGridConfig, DataGridUsage};
 use ai_chat_view::AskAiButton;
+use one_core::gpui_tokio::Tokio;
 use one_core::settings::AppSettings;
+use parking_lot::Mutex;
 // 3. 当前 crate 导入（按模块分组）
 use db::{GlobalDbState, SqlErrorInfo, SqlResult, SqlSource};
 use gpui_component::checkbox::Checkbox;
 use rust_i18n::t;
+use tokio_util::sync::CancellationToken;
 
 // Structure to hold a single SQL result with its metadata
 #[derive(Clone)]
@@ -71,13 +76,26 @@ pub struct StatementListData {
     cached_filtered_items: Vec<StatementListItem>,
 }
 
+#[derive(Clone)]
+struct ResultExecutionContext {
+    connection_id: String,
+    database: Option<String>,
+    schema: Option<String>,
+    session_id: Option<String>,
+    database_type: one_core::storage::DatabaseType,
+}
+
 struct ResultsBatchUpdate {
     results: Vec<SqlResult>,
     current: usize,
     total: usize,
-    connection_id: String,
-    database: Option<String>,
-    database_type: one_core::storage::DatabaseType,
+    execution: ResultExecutionContext,
+    generation: u64,
+}
+
+struct ResultsBatchRender {
+    results: Vec<SqlResult>,
+    execution: ResultExecutionContext,
 }
 
 pub(crate) struct SessionSqlRun {
@@ -85,6 +103,7 @@ pub(crate) struct SessionSqlRun {
     pub session_id: String,
     pub connection_id: String,
     pub database: Option<String>,
+    pub schema: Option<String>,
     pub database_type: one_core::storage::DatabaseType,
 }
 
@@ -183,12 +202,21 @@ pub struct SqlResultTabContainer {
     pub total_elapsed_ms: Entity<f64>,
     /// 执行开始时间，用于实时更新运行时间
     pub execution_start: Entity<Option<Instant>>,
+    execution_history: Entity<ExecutionHistoryPanel>,
     /// 停止计时器的标志
     timer_stop_flag: Arc<AtomicBool>,
+    /// 当前执行的取消令牌
+    execution_cancellation: Arc<Mutex<Option<CancellationToken>>>,
+    /// 执行代次，用于阻止已取消任务覆盖后续查询状态
+    execution_generation: Arc<AtomicU64>,
 }
 
 impl SqlResultTabContainer {
-    pub(crate) fn new(_window: &mut Window, cx: &mut Context<Self>) -> SqlResultTabContainer {
+    pub(crate) fn new(
+        execution_history: Entity<ExecutionHistoryPanel>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> SqlResultTabContainer {
         let result_tabs = cx.new(|_| vec![]);
         let active_result_tab = cx.new(|_| 0);
         let all_results = cx.new(|_| vec![]);
@@ -201,6 +229,8 @@ impl SqlResultTabContainer {
         let total_elapsed_ms = cx.new(|_| 0.0);
         let execution_start = cx.new(|_| None);
         let timer_stop_flag = Arc::new(AtomicBool::new(false));
+        let execution_cancellation = Arc::new(Mutex::new(None));
+        let execution_generation = Arc::new(AtomicU64::new(0));
         SqlResultTabContainer {
             result_tabs,
             active_result_tab,
@@ -213,12 +243,70 @@ impl SqlResultTabContainer {
             show_errors_only,
             total_elapsed_ms,
             execution_start,
+            execution_history,
             timer_stop_flag,
+            execution_cancellation,
+            execution_generation,
         }
     }
 }
 
 impl SqlResultTabContainer {
+    fn begin_execution(&mut self) -> (u64, CancellationToken) {
+        if let Some(cancellation) = self.execution_cancellation.lock().take() {
+            cancellation.cancel();
+        }
+        let generation = self.execution_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let cancellation = CancellationToken::new();
+        *self.execution_cancellation.lock() = Some(cancellation.clone());
+        (generation, cancellation)
+    }
+
+    fn is_current_execution(&self, generation: u64) -> bool {
+        self.execution_generation.load(Ordering::SeqCst) == generation
+    }
+
+    fn finish_execution(&self, generation: u64) {
+        if self.is_current_execution(generation) {
+            self.execution_cancellation.lock().take();
+        }
+    }
+
+    /// 取消当前 SQL 执行。返回是否确实存在运行中的任务。
+    pub fn cancel_execution(&mut self, cx: &mut App) -> bool {
+        if !self.is_executing(cx) {
+            return false;
+        }
+
+        self.execution_generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(cancellation) = self.execution_cancellation.lock().take() {
+            cancellation.cancel();
+        }
+        self.timer_stop_flag.store(true, Ordering::SeqCst);
+
+        let elapsed_ms = self
+            .execution_start
+            .read(cx)
+            .as_ref()
+            .map(|start| start.elapsed().as_millis() as f64);
+        self.execution_start.update(cx, |start, cx| {
+            *start = None;
+            cx.notify();
+        });
+        self.execution_state.update(cx, |state, cx| {
+            *state = ExecutionState::Completed;
+            cx.notify();
+        });
+        if let Some(elapsed_ms) = elapsed_ms {
+            self.total_elapsed_ms.update(cx, |elapsed, cx| {
+                *elapsed = elapsed_ms;
+                cx.notify();
+            });
+        }
+
+        true
+    }
+
     pub fn handle_run_query(
         &mut self,
         sql: String,
@@ -231,6 +319,8 @@ impl SqlResultTabContainer {
         let clone_self = self.clone();
         let connection_id_clone = connection_id.clone();
         let database_clone = current_database_value.clone();
+        let schema_clone = current_schema_value.clone();
+        let (generation, cancellation) = self.begin_execution();
 
         self.clear_results(cx);
 
@@ -323,18 +413,35 @@ impl SqlResultTabContainer {
                 max_rows,
                 ..Default::default()
             };
-            let mut rx = match global_state.execute_streaming(
+            let mut rx = match global_state.execute_streaming_cancellable(
                 cx,
                 connection_id_clone.clone(),
                 SqlSource::Script(sql.clone()),
                 current_database_value,
                 current_schema_value,
                 Some(exec_opts),
+                cancellation,
             ) {
                 Ok(receiver) => receiver,
                 Err(e) => {
                     error!("Error starting streaming execution: {:?}", e);
+                    let error_message = e.to_string();
                     cx.update(|cx| {
+                        if !clone_self.is_current_execution(generation) {
+                            return;
+                        }
+                        clone_self.execution_history.update(cx, |history, cx| {
+                            history.record_transport_error(
+                                ExecutionContext {
+                                    connection_id: connection_id_clone.clone(),
+                                    database: database_clone.clone(),
+                                    schema: schema_clone.clone(),
+                                },
+                                sql.clone(),
+                                error_message,
+                                cx,
+                            );
+                        });
                         // 停止计时器
                         clone_self.timer_stop_flag.store(true, Ordering::SeqCst);
                         // 清除开始时间
@@ -346,9 +453,17 @@ impl SqlResultTabContainer {
                             *state = ExecutionState::Idle;
                             cx.notify();
                         });
+                        clone_self.finish_execution(generation);
                     });
                     return None;
                 }
+            };
+            let execution = ResultExecutionContext {
+                connection_id: connection_id_clone.clone(),
+                database: database_clone,
+                schema: schema_clone,
+                session_id: None,
+                database_type,
             };
 
             let mut has_query_result = false;
@@ -365,6 +480,9 @@ impl SqlResultTabContainer {
                     Some(p) => p,
                     None => break,
                 };
+                if !clone_self.is_current_execution(generation) {
+                    return None;
+                }
 
                 let (current, total) = (progress.current, progress.total);
                 let result = progress.result;
@@ -390,9 +508,8 @@ impl SqlResultTabContainer {
                             results: results_to_send,
                             current,
                             total,
-                            connection_id: connection_id_clone.clone(),
-                            database: database_clone.clone(),
-                            database_type: database_type.clone(),
+                            execution: execution.clone(),
+                            generation,
                         },
                         cx,
                     );
@@ -403,13 +520,16 @@ impl SqlResultTabContainer {
             if !pending_results.is_empty() {
                 let results_to_send = pending_results;
                 cx.update(|cx| {
+                    if !clone_self.is_current_execution(generation) {
+                        return;
+                    }
                     if let Some(window_id) = cx.active_window() {
                         if let Err(err) = cx.update_window(window_id, |_entity, window, cx| {
                             clone_self.add_streaming_results_batch(
-                                results_to_send,
-                                connection_id_clone.clone(),
-                                database_clone.clone(),
-                                database_type,
+                                ResultsBatchRender {
+                                    results: results_to_send,
+                                    execution,
+                                },
                                 window,
                                 cx,
                             );
@@ -423,6 +543,9 @@ impl SqlResultTabContainer {
             // 最终状态更新
             let total_elapsed = execution_start.elapsed().as_secs_f64();
             cx.update(|cx| {
+                if !clone_self.is_current_execution(generation) {
+                    return;
+                }
                 // 停止计时器
                 clone_self.timer_stop_flag.store(true, Ordering::SeqCst);
 
@@ -452,6 +575,7 @@ impl SqlResultTabContainer {
                         clone_self.tab_scroll_handle.scroll_to_item(active_idx);
                     }
                 }
+                clone_self.finish_execution(generation);
             });
             Some(())
         })
@@ -461,6 +585,7 @@ impl SqlResultTabContainer {
     pub(crate) fn handle_run_query_with_session(&mut self, request: SessionSqlRun, cx: &mut App) {
         let clone_self = self.clone();
         let execution_start = Instant::now();
+        let (generation, cancellation) = self.begin_execution();
 
         self.clear_results(cx);
         self.timer_stop_flag.store(true, Ordering::SeqCst);
@@ -500,14 +625,32 @@ impl SqlResultTabContainer {
                 max_rows,
                 ..Default::default()
             };
-            let results = match global_state
-                .execute_session(
-                    request.session_id.clone(),
-                    request.sql.clone(),
-                    Some(exec_opts),
-                )
-                .await
-            {
+            let session_id = request.session_id.clone();
+            let sql = request.sql.clone();
+            let execution_state = global_state.clone();
+            let execution_task = Tokio::spawn_result(cx, async move {
+                execution_state
+                    .execute_session(session_id, sql, Some(exec_opts))
+                    .await
+            });
+            let execution_result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => None,
+                result = execution_task => Some(result),
+            };
+            let Some(execution_result) = execution_result else {
+                if let Err(error) = global_state
+                    .close_session(cx, request.session_id.clone())
+                    .await
+                {
+                    error!(
+                        "Failed to close cancelled manual transaction session: {:?}",
+                        error
+                    );
+                }
+                return None;
+            };
+            let results = match execution_result {
                 Ok(results) => results,
                 Err(error) => vec![SqlResult::Error(SqlErrorInfo {
                     sql: request.sql.clone(),
@@ -518,15 +661,22 @@ impl SqlResultTabContainer {
                 .iter()
                 .any(|result| matches!(result, SqlResult::Query(_)));
             let total_elapsed = execution_start.elapsed().as_secs_f64();
+            let execution = ResultExecutionContext {
+                connection_id: request.connection_id,
+                database: request.database,
+                schema: request.schema,
+                session_id: Some(request.session_id),
+                database_type: request.database_type,
+            };
 
             cx.update(|cx| {
+                if !clone_self.is_current_execution(generation) {
+                    return;
+                }
                 if let Some(window_id) = cx.active_window() {
                     if let Err(err) = cx.update_window(window_id, |_entity, window, cx| {
                         clone_self.add_streaming_results_batch(
-                            results,
-                            request.connection_id,
-                            request.database,
-                            request.database_type,
+                            ResultsBatchRender { results, execution },
                             window,
                             cx,
                         );
@@ -554,6 +704,7 @@ impl SqlResultTabContainer {
                     });
                     clone_self.tab_scroll_handle.scroll_to_item(1);
                 }
+                clone_self.finish_execution(generation);
             });
             Some(())
         })
@@ -585,6 +736,9 @@ impl SqlResultTabContainer {
 
     fn update_results_batch(&self, update: ResultsBatchUpdate, cx: &mut AsyncApp) {
         cx.update(|cx| {
+            if !self.is_current_execution(update.generation) {
+                return;
+            }
             if let Some(window_id) = cx.active_window() {
                 if let Err(err) = cx.update_window(window_id, |_entity, window, cx| {
                     self.execution_state.update(cx, |state, cx| {
@@ -596,10 +750,10 @@ impl SqlResultTabContainer {
                     });
 
                     self.add_streaming_results_batch(
-                        update.results,
-                        update.connection_id,
-                        update.database,
-                        update.database_type,
+                        ResultsBatchRender {
+                            results: update.results,
+                            execution: update.execution,
+                        },
                         window,
                         cx,
                     );
@@ -613,13 +767,29 @@ impl SqlResultTabContainer {
     /// 批量添加streaming结果并滚动到最新位置
     fn add_streaming_results_batch(
         &self,
-        results: Vec<SqlResult>,
-        connection_id: String,
-        database: Option<String>,
-        database_type: one_core::storage::DatabaseType,
+        batch: ResultsBatchRender,
         _window: &mut Window,
         cx: &mut App,
     ) {
+        let ResultsBatchRender { results, execution } = batch;
+        let ResultExecutionContext {
+            connection_id,
+            database,
+            schema,
+            session_id,
+            database_type,
+        } = execution;
+        self.execution_history.update(cx, |history, cx| {
+            history.record_sql_results(
+                ExecutionContext {
+                    connection_id: connection_id.clone(),
+                    database: database.clone(),
+                    schema: schema.clone(),
+                },
+                &results,
+                cx,
+            );
+        });
         let mut new_all_results = Vec::new();
         let mut new_tabs = Vec::new();
 
@@ -640,7 +810,7 @@ impl SqlResultTabContainer {
                     (false, "".to_string())
                 };
 
-                let config = DataGridConfig::new(
+                let mut config = DataGridConfig::new(
                     db_name.clone(),
                     table_name.clone(),
                     &connection_id,
@@ -652,8 +822,14 @@ impl SqlResultTabContainer {
                 .rows_count(query_result.rows.len())
                 .execution_time(query_result.elapsed_ms)
                 .sql(query_result.sql.clone());
+                if let Some(schema) = schema.clone() {
+                    config = config.with_schema(schema);
+                }
+                if let Some(session_id) = session_id.clone() {
+                    config = config.with_session_id(session_id);
+                }
 
-                let data_grid = cx.new(|cx| DataGrid::new(config, _window, cx));
+                let data_grid = cx.new(|cx| DataGrid::new(config, None, _window, cx));
                 let content = cx.new(|cx| CellPreviewHost::new(data_grid.clone(), _window, cx));
 
                 let columns = query_result
@@ -1105,7 +1281,7 @@ impl SqlResultTabContainer {
     fn render_sql_column(
         item: &StatementListItem,
         sql_display: String,
-        status_color: impl Into<gpui::Hsla>,
+        status_color: gpui::Hsla,
         idx: usize,
         _cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -1175,7 +1351,7 @@ impl SqlResultTabContainer {
     fn render_message_column(
         &self,
         item: &StatementListItem,
-        status_color: impl Into<gpui::Hsla>,
+        status_color: gpui::Hsla,
         idx: usize,
         _cx: &Context<Self>,
     ) -> impl IntoElement {

@@ -3,8 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::projection::{
-    expanded_display_cursor_offset_for_clean, expanded_display_offset_for_clean,
+    ExpandedInlineProjection, expanded_display_cursor_offset_for_clean,
+    expanded_display_offset_for_clean,
 };
+use super::{InlineFormat, toggle_raw_inline_format_text};
 use crate::components::markdown::code_highlight::{CodeHighlightPaint, CodeLanguageKey};
 use crate::components::markdown::inline::{
     InlineFragment, InlineInsertionAttributes, InlineLinkHit, InlineScript, InlineStyle,
@@ -14,7 +16,6 @@ use crate::components::markdown::link::parse_link_reference_definitions;
 use crate::components::{
     Block, BlockKind, BlockRecord, DeleteBack, IndentBlock, Newline, TableCellPosition,
 };
-use crate::i18n::I18nManager;
 use crate::theme::ThemeManager;
 use crate::{
     CodeHighlightProvider, CodeHighlightResult as HostCodeHighlightResult, CodeHighlightService,
@@ -24,6 +25,7 @@ use gpui::{
     AppContext, EntityInputHandler, FontStyle, FontWeight, Modifiers, MouseButton, MouseMoveEvent,
     TestAppContext, point, px, rgba,
 };
+use palette::IntoColor as _;
 
 fn assert_only_code_range(block: &Block, expected: Range<usize>) {
     let code_ranges = block
@@ -122,6 +124,95 @@ fn expanded_code_cursor_offset_keeps_plain_text_boundaries() {
 
     assert_eq!(expanded_display_cursor_offset_for_clean(&fragments, 1), 1);
     assert_eq!(expanded_display_cursor_offset_for_clean(&fragments, 3), 4);
+}
+
+#[test]
+fn expanded_footnote_projection_maps_only_to_utf8_boundaries() {
+    for id in ["éa", "aé", "€a", "a€", "中a", "a中", "é😀"] {
+        let raw = format!("[^{id}]");
+        let mut tree = InlineTextTree::from_markdown(&raw);
+        tree.apply_footnote_reference_state(|candidate| {
+            assert_eq!(candidate, id);
+            Some((12, 0))
+        });
+        let clean = tree.visible_text();
+        assert_eq!(clean, "¹²");
+
+        let projection =
+            ExpandedInlineProjection::build(&tree.fragments, 0..0, None).expect("projection");
+        let display = projection.cache.visible_text();
+        assert_eq!(display, raw);
+        assert_eq!(projection.clean_to_display_cursor.len(), clean.len() + 1);
+        assert_eq!(projection.display_to_clean.len(), display.len() + 1);
+        assert_eq!(projection.clean_to_display_cursor.first(), Some(&2));
+        assert_eq!(
+            projection.clean_to_display_cursor.last(),
+            Some(&(display.len() - 1))
+        );
+        assert_eq!(projection.display_to_clean.first(), Some(&0));
+        assert_eq!(projection.display_to_clean.last(), Some(&clean.len()));
+        assert!(
+            projection
+                .clean_to_display_cursor
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+        );
+        assert!(
+            projection
+                .display_to_clean
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+        );
+
+        for mapped in &projection.clean_to_display_cursor {
+            assert!(
+                display.is_char_boundary(*mapped),
+                "clean-to-display offset {mapped} is not a boundary in {display:?}"
+            );
+        }
+        for mapped in &projection.display_to_clean {
+            assert!(
+                clean.is_char_boundary(*mapped),
+                "display-to-clean offset {mapped} is not a boundary in {clean:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn adjacent_expanded_footnotes_share_the_same_markdown_boundary() {
+    let raw = "[^é][^中]";
+    let mut tree = InlineTextTree::from_markdown(raw);
+    let mut ordinal = 0;
+    tree.apply_footnote_reference_state(|_| {
+        ordinal += 1;
+        Some((ordinal, 0))
+    });
+    let clean = tree.visible_text();
+    assert_eq!(clean, "¹²");
+
+    let projection =
+        ExpandedInlineProjection::build(&tree.fragments, 0..clean.len(), None).expect("projection");
+    assert_eq!(projection.cache.visible_text(), raw);
+    assert_eq!(projection.footnote_runs.len(), 2);
+
+    let first = &projection.footnote_runs[0];
+    let second = &projection.footnote_runs[1];
+    let shared_display_offset = first.display_range.end;
+    assert_eq!(shared_display_offset, second.display_range.start);
+    assert_eq!(
+        projection
+            .footnote_run_containing_offset(shared_display_offset)
+            .expect("shared endpoint")
+            .clean_range,
+        first.clean_range
+    );
+
+    let map = tree.markdown_offset_map();
+    let first_markdown_end = map.visible_to_markdown_offset(first.clean_range.start)
+        + first.footnote.raw_markdown().len();
+    let second_markdown_start = map.visible_to_markdown_offset(second.clean_range.start);
+    assert_eq!(first_markdown_end, second_markdown_start);
 }
 
 #[test]
@@ -2127,6 +2218,119 @@ async fn source_raw_mode_does_not_enable_line_numbers(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn source_raw_inline_format_shortcuts_wrap_and_unwrap_selection(cx: &mut TestAppContext) {
+    let block = cx.new(|cx| {
+        let mut block = Block::with_record(
+            cx,
+            BlockRecord::new(BlockKind::Paragraph, InlineTextTree::plain("alpha beta")),
+        );
+        block.set_source_document_mode();
+        block
+    });
+
+    block.update(cx, |block, block_cx| {
+        block.selected_range = 0..5;
+        block.toggle_inline_format(InlineFormat::Bold, block_cx);
+    });
+
+    assert_eq!(
+        block.read_with(cx, |block, _cx| block.display_text().to_string()),
+        "**alpha** beta"
+    );
+    assert_eq!(
+        block.read_with(cx, |block, _cx| block.selected_range.clone()),
+        2..7
+    );
+
+    block.update(cx, |block, block_cx| {
+        block.toggle_inline_format(InlineFormat::Bold, block_cx);
+    });
+
+    assert_eq!(
+        block.read_with(cx, |block, _cx| block.display_text().to_string()),
+        "alpha beta"
+    );
+    assert_eq!(
+        block.read_with(cx, |block, _cx| block.selected_range.clone()),
+        0..5
+    );
+}
+
+#[gpui::test]
+async fn source_raw_inline_code_uses_a_safe_delimiter_run(cx: &mut TestAppContext) {
+    let block = cx.new(|cx| {
+        let mut block = Block::with_record(
+            cx,
+            BlockRecord::new(BlockKind::Paragraph, InlineTextTree::plain("a`b")),
+        );
+        block.set_source_document_mode();
+        block
+    });
+
+    block.update(cx, |block, block_cx| {
+        block.selected_range = 0..3;
+        block.toggle_inline_format(InlineFormat::Code, block_cx);
+    });
+
+    assert_eq!(
+        block.read_with(cx, |block, _cx| block.display_text().to_string()),
+        "``a`b``"
+    );
+    assert_eq!(
+        block.read_with(cx, |block, _cx| block.selected_range.clone()),
+        2..5
+    );
+}
+
+#[test]
+fn source_raw_inline_formats_round_trip_their_delimiters() {
+    for (format, wrapped, wrapped_selection) in [
+        (InlineFormat::Italic, "*alpha*", 1..6),
+        (InlineFormat::Underline, "<u>alpha</u>", 3..8),
+        (InlineFormat::Strikethrough, "~~alpha~~", 2..7),
+    ] {
+        let wrapped_edit =
+            toggle_raw_inline_format_text("alpha", 0..5, format).expect("format should wrap");
+        assert_eq!(wrapped_edit.text, wrapped);
+        assert_eq!(wrapped_edit.selection, wrapped_selection);
+
+        let unwrapped_edit =
+            toggle_raw_inline_format_text(&wrapped_edit.text, wrapped_edit.selection, format)
+                .expect("format should unwrap");
+        assert_eq!(unwrapped_edit.text, "alpha");
+        assert_eq!(unwrapped_edit.selection, 0..5);
+    }
+}
+
+#[test]
+fn source_raw_italic_preserves_existing_bold_delimiters() {
+    let italicized = toggle_raw_inline_format_text("**alpha**", 2..7, InlineFormat::Italic)
+        .expect("italic should be added");
+    assert_eq!(italicized.text, "***alpha***");
+    assert_eq!(italicized.selection, 3..8);
+
+    let restored =
+        toggle_raw_inline_format_text(&italicized.text, italicized.selection, InlineFormat::Italic)
+            .expect("italic should be removed");
+    assert_eq!(restored.text, "**alpha**");
+    assert_eq!(restored.selection, 2..7);
+}
+
+#[test]
+fn source_raw_inline_code_round_trips_padding_and_safe_delimiters() {
+    let wrapped = toggle_raw_inline_format_text("`alpha", 0..6, InlineFormat::Code)
+        .expect("inline code should wrap");
+    assert_eq!(wrapped.text, "`` `alpha ``");
+    assert_eq!(wrapped.selection, 3..9);
+
+    let unwrapped =
+        toggle_raw_inline_format_text(&wrapped.text, wrapped.selection, InlineFormat::Code)
+            .expect("inline code should unwrap");
+    assert_eq!(unwrapped.text, "`alpha");
+    assert_eq!(unwrapped.selection, 0..6);
+}
+
+#[gpui::test]
 async fn ime_replace_and_mark_text_replaces_right_to_left_selection_in_table_cell(
     cx: &mut TestAppContext,
 ) {
@@ -2557,14 +2761,14 @@ async fn host_code_highlighter_wins_and_normalizes_overlapping_ranges(cx: &mut T
                 HostCodeHighlightSpan {
                     range: 2..5,
                     style: CodeHighlightStyle {
-                        color: Some(rgba(0x00ff00ff).into()),
+                        color: Some(rgba(0x00ff00ff).into_color()),
                         ..CodeHighlightStyle::default()
                     },
                 },
                 HostCodeHighlightSpan {
                     range: 0..4,
                     style: CodeHighlightStyle {
-                        color: Some(rgba(0xff0000ff).into()),
+                        color: Some(rgba(0xff0000ff).into_color()),
                         font_weight: Some(FontWeight::BOLD),
                         font_style: Some(FontStyle::Italic),
                     },
@@ -2762,7 +2966,6 @@ async fn code_block_language_accepts_unknown_language_as_plain_rendering(cx: &mu
 #[gpui::test]
 async fn non_dragging_mouse_move_ends_stale_text_selection(cx: &mut TestAppContext) {
     cx.update(|cx| {
-        I18nManager::init(cx);
         ThemeManager::init(cx);
     });
     let (block, cx) = cx.add_window_view(|_window, cx| {
@@ -2795,7 +2998,6 @@ async fn non_dragging_mouse_move_ends_stale_text_selection(cx: &mut TestAppConte
 #[gpui::test]
 async fn dragging_mouse_move_keeps_text_selection_session_active(cx: &mut TestAppContext) {
     cx.update(|cx| {
-        I18nManager::init(cx);
         ThemeManager::init(cx);
     });
     let (block, cx) = cx.add_window_view(|_window, cx| {

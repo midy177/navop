@@ -93,6 +93,7 @@ impl IconName {
             Self::NotesColor
             | Self::TeamColor
             | Self::File
+            | Self::Json
             | Self::MarkdownColor
             | Self::RichTextColor
             | Self::Folder
@@ -222,6 +223,7 @@ impl IconName {
             | Self::Info
             | Self::Inspector
             | Self::LayoutDashboard
+            | Self::ListChecks
             | Self::Loader
             | Self::LoaderCircle
             | Self::LocateActiveTab

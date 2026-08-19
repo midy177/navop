@@ -282,6 +282,12 @@ mod tests {
                 auth_method: SshAuthMethod::Password {
                     password: TARGET_PASSWORD.to_string(),
                 },
+                credential_reference: None,
+                prompt_username: None,
+                prompt_password: None,
+                keyboard_interactive: None,
+                terminal_encoding: Default::default(),
+                terminal_type: Default::default(),
                 connect_timeout: Some(10),
                 keepalive_interval: Some(30),
                 keepalive_max: Some(6),
@@ -294,6 +300,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         );

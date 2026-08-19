@@ -30,6 +30,20 @@ pub enum RecordingBackend {
     Local,
     Ssh,
     Serial,
+    Telnet,
+}
+
+/// Product-level semantics for an artifact stored in the asciicast container.
+///
+/// Recordings expose a playback timeline. Session logs reuse the same
+/// terminal-parser event stream as durable storage, but are presented as a
+/// static, read-only terminal history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingArtifactKind {
+    #[default]
+    Recording,
+    SessionLog,
 }
 
 /// Metadata accepted from the active session when a recording starts.
@@ -41,9 +55,35 @@ pub struct RecordingMetadata {
     pub recording_id: String,
     pub session_id: String,
     pub backend: RecordingBackend,
+    pub artifact_kind: RecordingArtifactKind,
     pub application_version: String,
     pub started_at_unix_ms: u64,
     pub capture_input: bool,
+    pub session: Option<RecordingSessionMetadata>,
+}
+
+/// Non-secret connection identity attached to a recording.
+///
+/// Authentication material, environment values, connection strings, command
+/// text, key paths and credential references must never be added here.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingSessionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_port: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,10 +92,14 @@ pub struct RecordingHeaderMetadata {
     pub recording_id: String,
     pub session_id: String,
     pub backend: RecordingBackend,
+    #[serde(default)]
+    pub artifact_kind: RecordingArtifactKind,
     pub application_version: String,
     pub started_at_unix_ms: u64,
     pub capture_input: bool,
     pub event_stream: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<RecordingSessionMetadata>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,10 +123,12 @@ impl RecordingHeader {
                 recording_id: metadata.recording_id,
                 session_id: metadata.session_id,
                 backend: metadata.backend,
+                artifact_kind: metadata.artifact_kind,
                 application_version: metadata.application_version,
                 started_at_unix_ms: metadata.started_at_unix_ms,
                 capture_input: metadata.capture_input,
                 event_stream: NAVOP_EVENT_STREAM.to_string(),
+                session: metadata.session,
             },
         }
     }

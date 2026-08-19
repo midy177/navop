@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use gpui::{Image, Pixels, Point, SharedString};
 use uuid::Uuid;
 
+use super::runtime::HostRenderedArtifact;
 use crate::components::markdown::html::{HtmlDocument, parse_html_document};
 use crate::components::markdown::image::parse_standalone_image;
 use crate::components::markdown::inline::InlineTextTree;
@@ -779,6 +780,14 @@ pub enum BlockEvent {
     RequestDowngradeNestedListItemToChildParagraph,
     /// Toggle the checked state of a task-list item.
     ToggleTaskChecked,
+    /// Convert the focused block to a specific Markdown block kind.
+    RequestSetBlockKind { kind: BlockKind },
+    /// Move the focused block before its previous sibling.
+    RequestMoveBlockUp,
+    /// Move the focused block after its next sibling.
+    RequestMoveBlockDown,
+    /// Deep-clone the focused block and its descendants after itself.
+    RequestDuplicateBlock,
     /// Prompt to open the clicked inline link destination.
     /// `prompt_target` preserves the raw syntax target shown to the user,
     /// while `open_target` is the resolved destination actually opened.
@@ -795,10 +804,8 @@ pub enum BlockEvent {
     RequestTableCellMoveHorizontal { delta: i32 },
     /// Move focus vertically across native table cells.
     RequestTableCellMoveVertical { delta: i32 },
-    /// Append one empty column to a native table.
-    RequestAppendTableColumn,
-    /// Append one empty body row to a native table.
-    RequestAppendTableRow,
+    /// Open the table context menu for the cell that emitted this event.
+    RequestOpenTableContextMenu { position: Point<Pixels> },
     /// Insert an empty visual row before/after the active row.
     RequestInsertTableRow { visual_row: usize, after: bool },
     /// Insert an empty column before/after the active column.
@@ -848,6 +855,22 @@ pub enum BlockEvent {
     /// The user clicked this block; notify siblings so they re-render
     /// in display mode.
     RequestFocus,
+    /// The user clicked a rendered Mermaid or math block to enlarge it. The
+    /// editor opens an overlay showing the rendered preview directly.
+    RequestEnlargeRenderedBlock {
+        kind: EnlargedBlockKind,
+        source: String,
+        artifact: HostRenderedArtifact,
+    },
+}
+
+/// Which block kind the enlarged rendered view was opened for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnlargedBlockKind {
+    /// A fenced Mermaid diagram.
+    Mermaid,
+    /// A display-math `$$...$$` block.
+    Math,
 }
 
 /// Undo coalescing category captured before a mutation.

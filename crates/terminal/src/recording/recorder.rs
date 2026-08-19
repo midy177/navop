@@ -1,11 +1,11 @@
 use super::asciicast::{
-    RecordingFileError, RecordingFileLimit, RecordingFileLimits, RecordingHeader,
-    RecordingMetadata, encode_event, encode_header,
+    RecordingArtifactKind, RecordingFileError, RecordingFileLimit, RecordingFileLimits,
+    RecordingHeader, RecordingMetadata, encode_event, encode_header,
 };
 use super::{RecordingEvent, RecordingEventKind};
 use crate::TerminalSize;
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -93,22 +93,17 @@ impl RecordingFileWriter {
             ));
         }
 
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&partial_path)
-            .map_err(|error| RecordingFileError::io("create partial file", error))?;
-        let mut writer = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
-        writer
-            .write_all(&header_line)
-            .map_err(|error| RecordingFileError::io("write header", error))?;
-        writer
-            .flush()
-            .map_err(|error| RecordingFileError::io("flush header", error))?;
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|error| RecordingFileError::io("sync header", error))?;
+        let writer = create_partial_file(&partial_path, |writer| {
+            writer
+                .write_all(&header_line)
+                .map_err(|error| RecordingFileError::io("write header", error))?;
+            writer
+                .flush()
+                .map_err(|error| RecordingFileError::io("flush header", error))?;
+            writer
+                .sync_all()
+                .map_err(|error| RecordingFileError::io("sync header", error))
+        })?;
 
         Ok(Self {
             config,
@@ -225,6 +220,11 @@ impl RecordingFileWriter {
         self.last_elapsed = Some(event.elapsed);
         if self.events_since_flush >= self.config.flush_every_events {
             self.flush()?;
+        } else if self.metadata.artifact_kind == RecordingArtifactKind::SessionLog {
+            let result = self.flush_buffer_open_file();
+            if let Err(error) = result {
+                return self.fail(error);
+            }
         }
         Ok(())
     }
@@ -282,20 +282,45 @@ impl RecordingFileWriter {
     }
 
     fn flush_open_file(&mut self) -> Result<(), RecordingFileError> {
-        let writer = self.writer.as_mut().ok_or(RecordingFileError::NotOpen)?;
-        writer
-            .flush()
-            .map_err(|error| RecordingFileError::io("flush recording", error))?;
-        writer
+        self.flush_buffer_open_file()?;
+        self.writer
+            .as_ref()
+            .ok_or(RecordingFileError::NotOpen)?
             .get_ref()
             .sync_data()
             .map_err(|error| RecordingFileError::io("sync recording data", error))
+    }
+
+    fn flush_buffer_open_file(&mut self) -> Result<(), RecordingFileError> {
+        let writer = self.writer.as_mut().ok_or(RecordingFileError::NotOpen)?;
+        writer
+            .flush()
+            .map_err(|error| RecordingFileError::io("flush recording", error))
     }
 
     fn fail<T>(&mut self, error: RecordingFileError) -> Result<T, RecordingFileError> {
         self.state = RecordingFileState::Failed;
         Err(error)
     }
+}
+
+pub(super) fn create_partial_file(
+    partial_path: &Path,
+    initialize: impl FnOnce(&mut File) -> Result<(), RecordingFileError>,
+) -> Result<BufWriter<File>, RecordingFileError> {
+    let parent = partial_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".navop-recording-")
+        .tempfile_in(parent)
+        .map_err(|error| RecordingFileError::io("create temporary recording", error))?;
+    initialize(temporary.as_file_mut())?;
+    let file = temporary
+        .persist_noclobber(partial_path)
+        .map_err(|error| RecordingFileError::io("create partial file", error.error))?;
+    Ok(BufWriter::with_capacity(WRITE_BUFFER_BYTES, file))
 }
 
 pub fn partial_recording_path(final_path: &Path) -> Result<PathBuf, RecordingFileError> {

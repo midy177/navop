@@ -1,7 +1,7 @@
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render, Styled,
-    Window, div, px,
+    App, ColorExt, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render,
+    Styled, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable, IconName, Sizable,
@@ -366,6 +366,7 @@ mod tests {
                 port: 0,
                 username: String::new(),
                 password: String::new(),
+                credential_reference: None,
                 database: None,
                 service_name: None,
                 sid: None,
@@ -391,6 +392,7 @@ mod tests {
                 port: 0,
                 username: String::new(),
                 password: String::new(),
+                credential_reference: None,
                 database: None,
                 service_name: None,
                 sid: None,

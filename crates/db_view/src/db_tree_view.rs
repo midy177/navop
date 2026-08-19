@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 // 2. 外部 crate 导入（按字母顺序）
+use connection_form::credential::resolve_connection_for_runtime;
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, ListSizingBehavior, MouseButton, ParentElement, Render,
@@ -39,6 +40,7 @@ use crate::extension_menu::{
 use crate::search_shortcut::{
     DB_SEARCH_CONTEXT, FocusSearchInput, OpenSelectedTableQuery, focus_search_input,
 };
+use crate::table_copy_menu::append_table_copy_items;
 use db::{
     DbNode, DbNodeType, GlobalDbState,
     ipc::{driver_icon_from_asset_path, driver_icon_from_file_path},
@@ -937,7 +939,11 @@ impl DbTreeView {
                     }
                 }
             }
-            ConnectionDataEvent::CloudSyncRequested | ConnectionDataEvent::TeamCacheUpdated => {}
+            ConnectionDataEvent::CredentialCreated { .. }
+            | ConnectionDataEvent::CredentialUpdated { .. }
+            | ConnectionDataEvent::CredentialDeleted { .. }
+            | ConnectionDataEvent::CloudSyncRequested
+            | ConnectionDataEvent::TeamCacheUpdated => {}
         }
     }
 
@@ -982,10 +988,22 @@ impl DbTreeView {
 
     /// 更新连接信息（名称等）
     fn update_connection_info(&mut self, connection: &StoredConnection, cx: &mut Context<Self>) {
+        let connection = match resolve_connection_for_runtime(connection.clone(), cx) {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!(
+                    "Ignoring database connection update whose credentials could not be resolved \
+                     (id={:?}, name={}): {}",
+                    connection.id, connection.name, error
+                );
+                return;
+            }
+        };
+
         if let Ok(config) = connection.to_db_connection() {
             let id = connection.id.unwrap_or(0).to_string();
             info!("Updating connection info: {}", id);
-            sync_selected_databases_for_connection(&mut self.selected_databases, connection);
+            sync_selected_databases_for_connection(&mut self.selected_databases, &connection);
 
             if let Some(node) = self.db_nodes.get_mut(&id) {
                 apply_connection_node_config(node, &config, external_driver_metadata(&config));
@@ -1014,6 +1032,18 @@ impl DbTreeView {
 
     /// 添加新连接节点
     pub fn add_connection(&mut self, connection: &StoredConnection, cx: &mut Context<Self>) {
+        let connection = match resolve_connection_for_runtime(connection.clone(), cx) {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!(
+                    "Ignoring database connection creation whose credentials could not be \
+                     resolved (id={:?}, name={}): {}",
+                    connection.id, connection.name, error
+                );
+                return;
+            }
+        };
+
         if let Ok(config) = connection.to_db_connection() {
             let id = connection.id.unwrap_or(0).to_string();
 
@@ -1029,7 +1059,7 @@ impl DbTreeView {
                 }
             }
 
-            sync_selected_databases_for_connection(&mut self.selected_databases, connection);
+            sync_selected_databases_for_connection(&mut self.selected_databases, &connection);
 
             let node = connection_node(id.clone(), config.name.to_string(), &config);
             let global_db_state = cx.global_mut::<GlobalDbState>();
@@ -3024,6 +3054,11 @@ impl DbTreeView {
             menu = Self::render_extension_menu_items(menu, extension_items, is_active, node);
         }
 
+        if node.node_type == DbNodeType::Table {
+            menu = menu.separator();
+            menu = append_table_copy_items(menu, node);
+        }
+
         // 添加通用的刷新菜单项
         let view_ref = view.clone();
         let node_id_for_refresh = node_id.to_string();
@@ -3106,6 +3141,7 @@ mod tests {
             port: 0,
             username: String::new(),
             password: String::new(),
+            credential_reference: None,
             database: None,
             service_name: None,
             sid: None,

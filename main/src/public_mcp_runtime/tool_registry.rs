@@ -5,7 +5,7 @@ use one_core::tab_container::TabOpenMode;
 use public_mcp::tools::{
     PublicMcpToolProvider, PublicMcpToolRegistry, ToolRuntimeMcpProvider,
     internal_function_tool_registry, remote_ops_tool_registry, terminal_control_tool_registry,
-    terminal_exec_tool_registry, terminal_read_tool_registry,
+    terminal_exec_tool_registry, terminal_read_tool_registry, terminal_write_keys_tool_registry,
 };
 use std::sync::Arc;
 
@@ -53,7 +53,8 @@ fn build_tool_registry_for_surface(
             if toolsets.terminal_exec {
                 runtime_registries.push(terminal_exec_tool_registry(registry.clone()));
                 runtime_registries.push(terminal_read_tool_registry(registry.clone()));
-                runtime_registries.push(terminal_control_tool_registry(registry));
+                runtime_registries.push(terminal_control_tool_registry(registry.clone()));
+                runtime_registries.push(terminal_write_keys_tool_registry(registry));
             }
         } else {
             tracing::warn!("Public MCP terminal registry is not initialized");
@@ -908,6 +909,7 @@ mod tests {
             port: 0,
             username: String::new(),
             password: String::new(),
+            credential_reference: None,
             database: None,
             service_name: None,
             sid: None,
@@ -923,6 +925,12 @@ mod tests {
             port: 22,
             username: "root".to_string(),
             auth_method: SshAuthMethod::Agent,
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            keyboard_interactive: None,
+            terminal_encoding: Default::default(),
+            terminal_type: Default::default(),
             connect_timeout: None,
             keepalive_interval: None,
             keepalive_max: None,
@@ -935,6 +943,7 @@ mod tests {
             proxy: None,
             os_id: None,
             icon: None,
+            account_expect: Default::default(),
         }
     }
 

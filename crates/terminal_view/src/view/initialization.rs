@@ -15,6 +15,7 @@ impl TerminalView {
             tab_index,
             duplicate_source,
             recording_playback_name,
+            session_log_name,
         } = init;
         let blink_manager = cx.new(|_| BlinkCursor::new());
         let recording_playback_slider = cx.new(|_| {
@@ -191,6 +192,7 @@ impl TerminalView {
             terminal,
             duplicate_source,
             recording_playback_name,
+            session_log_name,
             local_working_dir: if is_local_terminal {
                 local_working_dir
             } else {
@@ -230,6 +232,9 @@ impl TerminalView {
             render_cache: RenderCache::new(DEFAULT_ROWS, DEFAULT_COLS, colors),
             terminal_frame_snapshot: TerminalFrameSnapshot::default(),
             terminal_render_retry: None,
+            selection_autoscroll_position: None,
+            selection_autoscroll_display_offset: None,
+            selection_autoscroll_task: None,
             focus_handle,
             performance_metrics,
             terminal_bounds: Bounds::default(),
@@ -246,9 +251,12 @@ impl TerminalView {
             recording_playback_control_error: None,
             recording_playback_ticker: None,
             cd_completion_client: None,
-            cd_completion_cache: HashMap::new(),
+            cd_completion_session_manager: None,
+            cd_completion_cache: CdCompletionCache::default(),
             cd_completion_loading_parent: None,
+            credential_inputs: None,
             ssh_mfa_inputs: Vec::new(),
+            zmodem_picker_request_id: None,
             focus_terminal_after_connect: false,
             reconnect_success_pending: false,
             current_theme: default_theme,
@@ -272,6 +280,8 @@ impl TerminalView {
             render_mode: TerminalRenderMode::Embedded,
         };
         this.apply_settings_snapshot(&initial_settings, window, cx);
+        this.sync_credential_inputs(window, cx);
+        this.sync_ssh_mfa_inputs(window, cx);
         this.register_broadcast_input(cx);
         this.start_performance_diagnostics(connection_id, connection_kind, cx);
         this

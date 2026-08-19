@@ -18,7 +18,7 @@ use crate::{
     ActiveTheme as _, Colorize, IconName, Root, Selectable, Sizable as _,
     button::{Button, ButtonVariants as _},
     input::{RopeExt as _, blink_cursor::CURSOR_WIDTH, display_map::LineLayout},
-    scroll::Scrollbar,
+    scroll::{Scrollbar, ScrollbarShow},
 };
 
 use super::{InputState, LastLayout, WhitespaceIndicators, mode::InputMode};
@@ -104,11 +104,12 @@ impl EditorScrollbarLayout {
 
 pub(super) struct EditorScrollbar {
     state: Entity<InputState>,
+    show: Option<ScrollbarShow>,
 }
 
 impl EditorScrollbar {
-    pub(super) fn new(state: Entity<InputState>) -> Self {
-        Self { state }
+    pub(super) fn new(state: Entity<InputState>, show: Option<ScrollbarShow>) -> Self {
+        Self { state, show }
     }
 }
 
@@ -170,9 +171,13 @@ impl Element for EditorScrollbar {
             Scrollbar::new(&scroll_handle)
         } else {
             Scrollbar::vertical(&scroll_handle)
+        };
+        if let Some(show) = self.show {
+            scrollbar = scrollbar.scrollbar_show(show);
         }
-        .scroll_size(snapshot.layout.scroll_size)
-        .into_any_element();
+        let mut scrollbar = scrollbar
+            .scroll_size(snapshot.layout.scroll_size)
+            .into_any_element();
 
         scrollbar.prepaint_as_root(
             snapshot.layout.bounds.origin,
@@ -846,6 +851,7 @@ impl TextElement {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    letter_spacing: None,
                 }],
                 None,
             );
@@ -903,6 +909,7 @@ impl TextElement {
                 background_color: None,
                 underline: None,
                 strikethrough: None,
+                letter_spacing: None,
             }],
             None,
         );
@@ -918,6 +925,7 @@ impl TextElement {
                 background_color: None,
                 underline: None,
                 strikethrough: None,
+                letter_spacing: None,
             }],
             None,
         );
@@ -978,6 +986,7 @@ impl TextElement {
                 background_color: None,
                 underline: None,
                 strikethrough: None,
+                letter_spacing: None,
             };
             Some(
                 window
@@ -1001,6 +1010,7 @@ impl TextElement {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    letter_spacing: None,
                 };
                 // Use space for empty lines so they take up height
                 let shaped_text = if text.is_empty() { " ".into() } else { text };
@@ -1626,6 +1636,7 @@ impl Element for TextElement {
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         };
         let marked_run = TextRun {
             len: 0,
@@ -1638,6 +1649,7 @@ impl Element for TextElement {
                 wavy: false,
             }),
             strikethrough: None,
+            letter_spacing: None,
         };
 
         let runs = if !is_empty {
@@ -1724,6 +1736,7 @@ impl Element for TextElement {
                         background_color: None,
                         underline: None,
                         strikethrough: None,
+                        letter_spacing: None,
                     }],
                     wrap_width,
                 )
@@ -1842,6 +1855,7 @@ impl Element for TextElement {
                 background_color: None,
                 underline: None,
                 strikethrough: None,
+                letter_spacing: None,
             }];
             let current_line_runs = vec![TextRun {
                 len: line_number_len,
@@ -1850,6 +1864,7 @@ impl Element for TextElement {
                 background_color: None,
                 underline: None,
                 strikethrough: None,
+                letter_spacing: None,
             }];
 
             // build line numbers
@@ -2429,7 +2444,7 @@ fn split_runs_by_bg_segments(
             // Add the overlapping part with background color
             let overlap_start = run_start.max(bg_range.start);
             let overlap_end = run_end.min(bg_range.end);
-            let text_color = if bg_color.l >= 0.5 {
+            let text_color = if bg_color.lightness >= 0.5 {
                 gpui::black()
             } else {
                 gpui::white()
@@ -2550,6 +2565,7 @@ mod tests {
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         };
 
         // use hello this-is-test
@@ -2608,6 +2624,7 @@ mod tests {
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         };
         let runs = clamp_text_runs_to_utf8_boundaries(
             "达梦",
@@ -2634,6 +2651,7 @@ mod tests {
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         };
 
         let runs = vec![
@@ -2672,6 +2690,7 @@ mod tests {
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         };
 
         let runs = vec![

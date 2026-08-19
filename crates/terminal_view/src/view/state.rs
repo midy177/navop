@@ -45,6 +45,45 @@ pub(super) struct SshMfaInput {
     pub(super) input: Entity<InputState>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum TerminalCredentialRequest {
+    Ssh(TerminalSshCredentialRequest),
+    Telnet(TerminalTelnetCredentialRequest),
+}
+
+impl TerminalCredentialRequest {
+    pub(super) fn generation(&self) -> u64 {
+        match self {
+            Self::Ssh(request) => request.generation(),
+            Self::Telnet(request) => request.generation(),
+        }
+    }
+
+    pub(super) fn username(&self) -> bool {
+        match self {
+            Self::Ssh(request) => request.username,
+            Self::Telnet(request) => request.username,
+        }
+    }
+
+    pub(super) fn password(&self) -> bool {
+        match self {
+            Self::Ssh(request) => request.password,
+            Self::Telnet(request) => request.password,
+        }
+    }
+
+    pub(super) fn is_telnet(&self) -> bool {
+        matches!(self, Self::Telnet(_))
+    }
+}
+
+pub(super) struct TerminalCredentialInputs {
+    pub(super) request: TerminalCredentialRequest,
+    pub(super) username: Option<Entity<InputState>>,
+    pub(super) password: Option<Entity<InputState>>,
+}
+
 #[derive(Clone)]
 pub(crate) enum TerminalDuplicateSource {
     Local(LocalConfig),
@@ -54,6 +93,7 @@ pub(crate) enum TerminalDuplicateSource {
         sync_path_with_terminal: bool,
     },
     Serial(StoredConnection),
+    Telnet(StoredConnection),
 }
 
 #[derive(Clone)]
@@ -115,13 +155,29 @@ pub(super) fn terminal_tab_duplicate_supported(
         ) | (
             Some(TerminalDuplicateSource::Serial(_)),
             Some(TerminalConnectionKind::Serial),
+        ) | (
+            Some(TerminalDuplicateSource::Telnet(_)),
+            Some(TerminalConnectionKind::Telnet),
         )
     )
 }
 
 impl TerminalView {
     pub(super) fn accepts_live_terminal_input(&self, cx: &App) -> bool {
-        live_terminal_input_supported(self.terminal.read(cx).live_connection_kind())
+        let terminal = self.terminal.read(cx);
+        live_terminal_input_supported(terminal.live_connection_kind())
+            && terminal.ssh_credential_request().is_none()
+            && terminal.telnet_credential_request().is_none()
+            && terminal.ssh_mfa_request().is_none()
+            && terminal.host_key_verification_request().is_none()
+    }
+
+    pub(super) fn has_blocking_auth_prompt(&self, cx: &App) -> bool {
+        let terminal = self.terminal.read(cx);
+        terminal.ssh_credential_request().is_some()
+            || terminal.telnet_credential_request().is_some()
+            || terminal.ssh_mfa_request().is_some()
+            || terminal.host_key_verification_request().is_some()
     }
 
     pub(super) fn is_live_ssh_terminal(&self, cx: &App) -> bool {
@@ -153,6 +209,7 @@ pub(super) fn terminal_duplicate_source_with_cwd(
             sync_path_with_terminal,
         },
         TerminalDuplicateSource::Serial(connection) => TerminalDuplicateSource::Serial(connection),
+        TerminalDuplicateSource::Telnet(connection) => TerminalDuplicateSource::Telnet(connection),
     }
 }
 

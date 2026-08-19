@@ -12,14 +12,25 @@ connection-form = { workspace = true }
 one-core = { workspace = true }
 one-ui = { workspace = true }
 remote_desktop = { workspace = true }
+windows_rdp_host = { workspace = true, optional = true }
+raw-window-handle = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 image = { workspace = true }
 smallvec = { workspace = true }
 rust-i18n = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "=0.26.0"
+
 [dev-dependencies]
+futures = { workspace = true }
+gpui = { workspace = true, features = ["test-support"] }
 tempfile = "3"
+
+[features]
+default = []
+windows-native-rdp = ["dep:raw-window-handle", "dep:windows_rdp_host"]
 
 [lints]
 workspace = true

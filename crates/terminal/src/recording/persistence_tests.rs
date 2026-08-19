@@ -1,9 +1,9 @@
 use super::{
-    ASCIICAST_VERSION, NAVOP_RECORDING_FORMAT_VERSION, RecordingBackend, RecordingCompleteness,
-    RecordingEvent, RecordingEventKind, RecordingFileConfig, RecordingFileError,
-    RecordingFileLimit, RecordingFileLimits, RecordingFileState, RecordingFileTransition,
-    RecordingFileWriter, RecordingMetadata, partial_recording_path, read_recording,
-    recover_partial_recording,
+    ASCIICAST_VERSION, NAVOP_RECORDING_FORMAT_VERSION, RecordingArtifactKind, RecordingBackend,
+    RecordingCompleteness, RecordingEvent, RecordingEventKind, RecordingFileConfig,
+    RecordingFileError, RecordingFileLimit, RecordingFileLimits, RecordingFileState,
+    RecordingFileTransition, RecordingFileWriter, RecordingMetadata, RecordingSessionMetadata,
+    partial_recording_path, read_recording, recover_partial_recording,
 };
 use crate::TerminalSize;
 use std::fs::{self, OpenOptions};
@@ -16,9 +16,11 @@ fn metadata(capture_input: bool) -> RecordingMetadata {
         recording_id: "recording-1".to_string(),
         session_id: "session-1".to_string(),
         backend: RecordingBackend::Local,
+        artifact_kind: RecordingArtifactKind::Recording,
         application_version: "0.1.0-test".to_string(),
         started_at_unix_ms: 1_700_000_000_123,
         capture_input,
+        session: None,
     }
 }
 
@@ -95,6 +97,10 @@ fn durable_writer_publishes_a_versioned_recording_only_after_stop() {
     assert_eq!("recording-1", recording.header.navop.recording_id);
     assert_eq!("session-1", recording.header.navop.session_id);
     assert_eq!(RecordingBackend::Local, recording.header.navop.backend);
+    assert_eq!(
+        RecordingArtifactKind::Recording,
+        recording.header.navop.artifact_kind
+    );
     assert_eq!(RecordingCompleteness::Complete, recording.completeness);
     assert_eq!(
         vec![
@@ -112,6 +118,71 @@ fn durable_writer_publishes_a_versioned_recording_only_after_stop() {
         ],
         recording.events
     );
+}
+
+#[test]
+fn session_metadata_roundtrips_without_exposing_authentication_material() {
+    let temp = tempdir().unwrap();
+    let final_path = temp.path().join("ssh-session.cast");
+    let mut metadata = metadata(false);
+    metadata.backend = RecordingBackend::Ssh;
+    metadata.session = Some(RecordingSessionMetadata {
+        connection_id: Some(42),
+        connection_name: Some("Production".to_string()),
+        local_user: Some("alice".to_string()),
+        local_host: Some("workstation".to_string()),
+        remote_user: Some("deploy".to_string()),
+        remote_host: Some("server.example".to_string()),
+        remote_port: Some(22),
+        serial_port: None,
+    });
+
+    let mut writer = RecordingFileWriter::create(
+        &final_path,
+        metadata,
+        initial_size(),
+        RecordingFileConfig::default(),
+    )
+    .unwrap();
+    writer.stop().unwrap();
+
+    let raw = fs::read_to_string(&final_path).unwrap();
+    assert!(raw.contains("\"connection_name\":\"Production\""));
+    assert!(raw.contains("\"remote_host\":\"server.example\""));
+    assert!(!raw.contains("password"));
+    assert!(!raw.contains("private_key"));
+    assert!(!raw.contains("credential_reference"));
+
+    let recording = read_recording(&final_path, RecordingFileLimits::default()).unwrap();
+    let session = recording.header.navop.session.unwrap();
+    assert_eq!(Some(42), session.connection_id);
+    assert_eq!(Some("deploy"), session.remote_user.as_deref());
+    assert_eq!(Some("server.example"), session.remote_host.as_deref());
+    assert_eq!(Some(22), session.remote_port);
+}
+
+#[test]
+fn legacy_navop_header_without_session_metadata_remains_readable() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("legacy.cast");
+    fs::write(
+        &path,
+        concat!(
+            "{\"version\":2,\"width\":80,\"height\":24,\"timestamp\":1700000000,",
+            "\"navop\":{\"format_version\":1,\"recording_id\":\"r\",",
+            "\"session_id\":\"s\",\"backend\":\"local\",",
+            "\"application_version\":\"test\",\"started_at_unix_ms\":1700000000000,",
+            "\"capture_input\":false,\"event_stream\":\"terminal_parser_input_v1\"}}\n"
+        ),
+    )
+    .unwrap();
+
+    let recording = read_recording(&path, RecordingFileLimits::default()).unwrap();
+    assert_eq!(
+        RecordingArtifactKind::Recording,
+        recording.header.navop.artifact_kind
+    );
+    assert_eq!(None, recording.header.navop.session);
 }
 
 #[test]

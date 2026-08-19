@@ -23,6 +23,8 @@ use crate::search_shortcut::{
     DB_SEARCH_CONTEXT, FocusSearchInput, OpenSelectedTableQuery, OpenTableDesigner,
     focus_search_input,
 };
+use crate::sidebar::execution_history::ExecutionContext;
+use crate::sidebar::execution_history_panel::ExecutionHistoryPanel;
 use crate::sql_editor::SqlEditor;
 use crate::table_data::copy_format::{CopyFormat, CopyFormatter, TableMetadata};
 use crate::table_data::filter_editor::{FilterEditorEvent, TableFilterEditor, TableSchema};
@@ -35,6 +37,7 @@ use db::{
 use gpui_component::button::ButtonVariants;
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use one_core::gpui_tokio::Tokio;
 use one_core::popup_window::{PopupWindowOptions, open_popup_window};
 use one_core::settings::{AppSettings, LargeTextCellEditorOpenMode};
 use one_core::storage::DatabaseType;
@@ -148,6 +151,86 @@ pub enum DataGridUsage {
     SqlResult,
 }
 
+type ExportPayload = (Vec<SharedString>, Vec<Vec<Option<String>>>);
+
+struct SqlResultExportRequest {
+    connection_id: String,
+    database: Option<String>,
+    schema: Option<String>,
+    session_id: Option<String>,
+    sql: String,
+}
+
+fn result_set_export_exec_options() -> ExecOptions {
+    ExecOptions {
+        max_rows: None,
+        ..Default::default()
+    }
+}
+
+async fn execute_sql_result_export(
+    global_state: GlobalDbState,
+    request: SqlResultExportRequest,
+    cx: &mut AsyncApp,
+) -> Result<ExportPayload, String> {
+    let SqlResultExportRequest {
+        connection_id,
+        database,
+        schema,
+        session_id,
+        sql,
+    } = request;
+    let options = Some(result_set_export_exec_options());
+    let results = match session_id {
+        Some(session_id) => {
+            Tokio::spawn_result(cx, async move {
+                global_state.execute_session(session_id, sql, options).await
+            })
+            .await
+        }
+        None => {
+            global_state
+                .execute_script(cx, connection_id, sql, database, schema, options)
+                .await
+        }
+    }
+    .map_err(|error| error.to_string())?;
+
+    query_result_for_export(results)
+}
+
+fn query_result_for_export(results: Vec<SqlResult>) -> Result<ExportPayload, String> {
+    let mut results = results.into_iter();
+    let result = results
+        .next()
+        .ok_or_else(|| "query returned no results".to_string())?;
+    if results.next().is_some() {
+        return Err("query returned multiple results".to_string());
+    }
+
+    match result {
+        SqlResult::Query(result) => Ok(DataGrid::normalize_query_result(result)),
+        SqlResult::Exec(_) => Err("statement did not return a result set".to_string()),
+        SqlResult::Error(error) => Err(error.message),
+    }
+}
+
+fn notify_export_failure(
+    cx: &mut AsyncApp,
+    window_id: Option<gpui::AnyWindowHandle>,
+    error: String,
+) {
+    let Some(window_id) = window_id else {
+        return;
+    };
+    let _ = cx.update_window(window_id, |_entity, window, cx| {
+        window.push_notification(
+            t!("TableDataGrid.export_failed", error = error).to_string(),
+            cx,
+        );
+    });
+}
+
 /// 数据表格配置
 #[derive(Clone, Debug, PartialEq)]
 pub struct DataGridConfig {
@@ -169,6 +252,8 @@ pub struct DataGridConfig {
     pub usage: DataGridUsage,
     /// 原始 SQL（SqlResult 场景使用）
     pub sql: String,
+    /// Existing execution session for manual transaction results.
+    pub session_id: Option<String>,
     /// 执行时间（SqlResult 场景使用）
     execution_time: u128,
     /// 数据行数（SqlResult 场景使用）
@@ -192,6 +277,7 @@ impl DataGridConfig {
             show_toolbar: true,
             usage: DataGridUsage::TableData,
             sql: "".to_string(),
+            session_id: None,
             execution_time: 0,
             rows_count: 0,
         }
@@ -219,6 +305,10 @@ impl DataGridConfig {
 
     pub fn sql(mut self, sql: impl Into<String>) -> Self {
         self.sql = sql.into();
+        self
+    }
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
         self
     }
     pub fn execution_time(mut self, execution_time: u128) -> Self {
@@ -344,6 +434,13 @@ fn table_has_unsaved_changes(editing_cell: Option<(usize, usize)>, change_count:
     editing_cell.is_some() || change_count > 0
 }
 
+fn first_execution_error(results: &[SqlResult]) -> Option<&str> {
+    results.iter().find_map(|result| match result {
+        SqlResult::Error(error) => Some(error.message.as_str()),
+        _ => None,
+    })
+}
+
 /// 数据表格组件
 pub struct DataGrid {
     /// 组件配置
@@ -364,12 +461,19 @@ pub struct DataGrid {
     search_input: Entity<InputState>,
     /// 搜索输入框事件订阅
     _search_sub: Option<Subscription>,
+    /// 当前数据库 tab 的共享 SQL 执行记录
+    execution_history: Option<Entity<ExecutionHistoryPanel>>,
     /// 侧边栏大文本编辑器是否已为当前表格打开
     is_large_text_editor_sidebar_open: bool,
 }
 
 impl DataGrid {
-    pub fn new(config: DataGridConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        config: DataGridConfig,
+        execution_history: Option<Entity<ExecutionHistoryPanel>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let editable = config.editable;
         let is_table_data = config.usage == DataGridUsage::TableData;
         let database_type = config.database_type.clone();
@@ -393,7 +497,6 @@ impl DataGrid {
                 .clean_on_escape()
         });
         let table_data_info = cx.new(|_| TableDataInfo::default());
-
         let mut result = Self {
             config,
             table,
@@ -404,6 +507,7 @@ impl DataGrid {
             _filter_sub: None,
             search_input,
             _search_sub: None,
+            execution_history,
             is_large_text_editor_sidebar_open: false,
         };
         result.bind_table_event(window, cx);
@@ -467,6 +571,37 @@ impl DataGrid {
             cx.notify();
         });
         cx.notify();
+    }
+
+    fn execution_context(&self) -> ExecutionContext {
+        ExecutionContext {
+            connection_id: self.config.connection_id.clone(),
+            database: Some(self.config.database_name.clone()),
+            schema: self.config.schema_name.clone(),
+        }
+    }
+
+    fn record_execution_results(&self, sql: String, results: &[SqlResult], cx: &mut App) {
+        let Some(execution_history) = &self.execution_history else {
+            return;
+        };
+        execution_history.update(cx, |history, cx| {
+            history.record_table_data_results(self.execution_context(), sql, results, cx);
+        });
+    }
+
+    fn record_execution_failure(&self, error: String, sql: Option<String>, cx: &mut App) {
+        let Some(execution_history) = &self.execution_history else {
+            return;
+        };
+        execution_history.update(cx, |history, cx| {
+            history.record_transport_error(
+                self.execution_context(),
+                sql.unwrap_or_default(),
+                error,
+                cx,
+            );
+        });
     }
 
     fn on_action_focus_search(
@@ -1013,6 +1148,8 @@ impl DataGrid {
         let connection_id = self.config.connection_id.clone();
         let database_name = self.config.database_name.clone();
         let schema_name = self.config.schema_name.clone();
+        let session_id = self.config.session_id.clone();
+        let sql = self.config.sql.clone();
         let table_name = self.config.table_name.clone();
         let current_page = self.table_data_info.read(cx).current_page;
         let total_count = self.table_data_info.read(cx).total_count;
@@ -1065,29 +1202,28 @@ impl DataGrid {
                                     Some((columns, rows))
                                 }
                                 Err(error) => {
-                                    let _ = cx.update(|cx| {
-                                        if let Some(window_id) = window_id {
-                                            let _ = cx.update_window(
-                                                window_id,
-                                                |_entity, window, cx| {
-                                                    window.push_notification(
-                                                        t!(
-                                                            "TableDataGrid.export_failed",
-                                                            error = error
-                                                        )
-                                                        .to_string(),
-                                                        cx,
-                                                    );
-                                                },
-                                            );
-                                        }
-                                    });
+                                    notify_export_failure(cx, window_id, error.to_string());
                                     return;
                                 }
                             }
                         }
                     }
-                    DataGridUsage::SqlResult => Self::collect_visible_rows(&table, cx),
+                    DataGridUsage::SqlResult => {
+                        let request = SqlResultExportRequest {
+                            connection_id: connection_id.clone(),
+                            database: (!database_name.is_empty()).then_some(database_name.clone()),
+                            schema: schema_name.clone(),
+                            session_id: session_id.clone(),
+                            sql: sql.clone(),
+                        };
+                        match execute_sql_result_export(global_state.clone(), request, cx).await {
+                            Ok(payload) => Some(payload),
+                            Err(error) => {
+                                notify_export_failure(cx, window_id, error);
+                                return;
+                            }
+                        }
+                    }
                 },
             };
 
@@ -1957,14 +2093,13 @@ impl DataGrid {
             state.commit_cell_edit(window, cx);
         });
         let changes = self.get_changes(cx);
+        let window_handle = window.window_handle();
         if changes.is_empty() {
-            if let Some(window_id) = cx.active_window() {
-                let _ = cx.update_window(window_id, |_, _window, cx| {
-                    tab_container.update(cx, |container, cx| {
-                        container.force_close_tab_by_id(&tab_id, cx);
-                    });
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                tab_container.update(cx, |container, cx| {
+                    container.force_close_tab_by_id(&tab_id, window, cx);
                 });
-            }
+            });
             return;
         }
 
@@ -1997,14 +2132,10 @@ impl DataGrid {
                     Ok(infos) => infos,
                     Err(err) => {
                         cx.update(|cx| {
-                            notification(
-                                cx,
-                                t!(
-                                    "TableDataGrid.get_table_keys_failed",
-                                    error = err.to_string()
-                                )
-                                .to_string(),
-                            );
+                            let error = err.to_string();
+                            let summary = t!("TableDataGrid.get_table_keys_failed", error = error)
+                                .to_string();
+                            notification(cx, summary);
                         });
                         return;
                     }
@@ -2037,7 +2168,9 @@ impl DataGrid {
             let (sql_content, change_count) = match save_result {
                 Ok((sql, count)) => (sql, count),
                 Err(msg) => {
-                    cx.update(|cx| notification(cx, msg));
+                    cx.update(|cx| {
+                        notification(cx, msg);
+                    });
                     return;
                 }
             };
@@ -2062,35 +2195,35 @@ impl DataGrid {
 
             cx.update(|cx| match result {
                 Ok(results) => {
-                    if let Some(err_msg) = results.iter().find_map(|res| match res {
-                        SqlResult::Error(err) => Some(err.message.clone()),
-                        _ => None,
-                    }) {
-                        notification(
-                            cx,
-                            t!("TableDataGrid.save_changes_failed", error = err_msg).to_string(),
-                        );
-                    } else {
-                        this.clear_changes(cx);
-                        notification(
-                            cx,
+                    let sql = sql_content.clone();
+                    let first_error = first_execution_error(&results).map(str::to_owned);
+                    let succeeded = first_error.is_none();
+                    this.record_execution_results(sql, &results, cx);
+                    let summary = first_error
+                        .map(|error| {
+                            t!("TableDataGrid.save_changes_failed", error = error).to_string()
+                        })
+                        .unwrap_or_else(|| {
                             t!("TableDataGrid.save_changes_success", count = change_count)
-                                .to_string(),
-                        );
-                        if let Some(window_id) = cx.active_window() {
-                            let _ = cx.update_window(window_id, |_, _window, cx| {
-                                tab_container.update(cx, |container, cx| {
-                                    container.force_close_tab_by_id(&tab_id, cx);
-                                });
+                                .to_string()
+                        });
+
+                    if succeeded {
+                        this.clear_changes(cx);
+                        let _ = cx.update_window(window_handle, |_, window, cx| {
+                            tab_container.update(cx, |container, cx| {
+                                container.force_close_tab_by_id(&tab_id, window, cx);
                             });
-                        }
+                        });
                     }
+                    notification(cx, summary);
                 }
-                Err(e) => {
-                    notification(
-                        cx,
-                        t!("TableDataGrid.save_changes_failed", error = e.to_string()).to_string(),
-                    );
+                Err(error) => {
+                    let error = error.to_string();
+                    let summary =
+                        t!("TableDataGrid.save_changes_failed", error = error).to_string();
+                    this.record_execution_failure(error, Some(sql_content), cx);
+                    notification(cx, summary);
                 }
             });
         })
@@ -2132,14 +2265,10 @@ impl DataGrid {
                     Ok(infos) => infos,
                     Err(err) => {
                         cx.update(|cx| {
-                            notification(
-                                cx,
-                                t!(
-                                    "TableDataGrid.get_table_keys_failed",
-                                    error = err.to_string()
-                                )
-                                .to_string(),
-                            );
+                            let error = err.to_string();
+                            let summary = t!("TableDataGrid.get_table_keys_failed", error = error)
+                                .to_string();
+                            notification(cx, summary);
                         });
                         return;
                     }
@@ -2172,7 +2301,9 @@ impl DataGrid {
             let (sql_content, change_count) = match save_result {
                 Ok((sql, count)) => (sql, count),
                 Err(msg) => {
-                    cx.update(|cx| notification(cx, msg));
+                    cx.update(|cx| {
+                        notification(cx, msg);
+                    });
                     return;
                 }
             };
@@ -2197,28 +2328,30 @@ impl DataGrid {
 
             cx.update(|cx| match result {
                 Ok(results) => {
-                    if let Some(err_msg) = results.iter().find_map(|res| match res {
-                        SqlResult::Error(err) => Some(err.message.clone()),
-                        _ => None,
-                    }) {
-                        notification(
-                            cx,
-                            t!("TableDataGrid.save_changes_failed", error = err_msg).to_string(),
-                        );
-                    } else {
-                        this.clear_changes_and_refresh(cx);
-                        notification(
-                            cx,
+                    let sql = sql_content.clone();
+                    let first_error = first_execution_error(&results).map(str::to_owned);
+                    let succeeded = first_error.is_none();
+                    this.record_execution_results(sql, &results, cx);
+                    let summary = first_error
+                        .map(|error| {
+                            t!("TableDataGrid.save_changes_failed", error = error).to_string()
+                        })
+                        .unwrap_or_else(|| {
                             t!("TableDataGrid.save_changes_success", count = change_count)
-                                .to_string(),
-                        );
+                                .to_string()
+                        });
+
+                    if succeeded {
+                        this.clear_changes_and_refresh(cx);
                     }
+                    notification(cx, summary);
                 }
-                Err(e) => {
-                    notification(
-                        cx,
-                        t!("TableDataGrid.save_changes_failed", error = e.to_string()).to_string(),
-                    );
+                Err(error) => {
+                    let error = error.to_string();
+                    let summary =
+                        t!("TableDataGrid.save_changes_failed", error = error).to_string();
+                    this.record_execution_failure(error, Some(sql_content), cx);
+                    notification(cx, summary);
                 }
             });
         })
@@ -2260,14 +2393,10 @@ impl DataGrid {
                     Ok(index_infos) => index_infos,
                     Err(err) => {
                         cx.update(|cx| {
-                            notification(
-                                cx,
-                                t!(
-                                    "TableDataGrid.get_table_keys_failed",
-                                    error = err.to_string()
-                                )
-                                .to_string(),
-                            );
+                            let error = err.to_string();
+                            let summary = t!("TableDataGrid.get_table_keys_failed", error = error)
+                                .to_string();
+                            notification(cx, summary);
                         });
                         return;
                     }
@@ -2369,7 +2498,7 @@ impl DataGrid {
         connection_id: String,
         database_name: String,
         cx: &mut AsyncApp,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<SqlResult>, String> {
         let exec_options = ExecOptions {
             stop_on_error: true,
             transactional: true,
@@ -2377,30 +2506,17 @@ impl DataGrid {
             streaming: false,
         };
 
-        let result = global_state
+        global_state
             .execute_script(
                 cx,
-                connection_id.clone(),
-                sql.clone(),
-                Some(database_name.clone()),
+                connection_id,
+                sql,
+                Some(database_name),
                 None,
                 Some(exec_options),
             )
-            .await;
-
-        match result {
-            Ok(results) => {
-                if let Some(err_msg) = results.iter().find_map(|res| match res {
-                    SqlResult::Error(err) => Some(err.message.clone()),
-                    _ => None,
-                }) {
-                    Err(t!("TableDataGrid.execute_failed", error = err_msg).to_string())
-                } else {
-                    Ok(())
-                }
-            }
-            Err(e) => Err(t!("TableDataGrid.execute_failed", error = e).to_string()),
-        }
+            .await
+            .map_err(|error| error.to_string())
     }
 
     fn execute_sql_and_refresh(
@@ -2415,6 +2531,7 @@ impl DataGrid {
         let data_grid = self.clone();
 
         cx.spawn(async move |cx: &mut AsyncApp| {
+            let executed_sql = sql.clone();
             match Self::execute_sql_and_refresh_async(
                 sql,
                 global_state,
@@ -2424,27 +2541,33 @@ impl DataGrid {
             )
             .await
             {
-                Ok(_) => {
+                Ok(results) => {
                     cx.update(|cx| {
-                        if let Some(window_id) = cx.active_window() {
-                            let _ = cx.update_window(window_id, |_entity, window, cx| {
-                                data_grid.clear_changes_and_refresh(cx);
-                                window.close_dialog(cx);
-                                window.push_notification(
-                                    t!("TableDataGrid.execute_success").to_string(),
-                                    cx,
-                                );
-                            });
+                        let first_error = first_execution_error(&results).map(str::to_owned);
+                        let succeeded = first_error.is_none();
+                        data_grid.record_execution_results(executed_sql.clone(), &results, cx);
+                        let summary = first_error
+                            .map(|error| {
+                                t!("TableDataGrid.execute_failed", error = error).to_string()
+                            })
+                            .unwrap_or_else(|| t!("TableDataGrid.execute_success").to_string());
+
+                        if succeeded {
+                            data_grid.clear_changes_and_refresh(cx);
+                            if let Some(window_id) = cx.active_window() {
+                                let _ = cx.update_window(window_id, |_entity, window, cx| {
+                                    window.close_dialog(cx);
+                                });
+                            }
                         }
+                        notification(cx, summary);
                     });
                 }
-                Err(error_msg) => {
+                Err(error) => {
                     cx.update(|cx| {
-                        if let Some(window_id) = cx.active_window() {
-                            let _ = cx.update_window(window_id, |_entity, window, cx| {
-                                window.push_notification(error_msg, cx);
-                            });
-                        }
+                        let summary = t!("TableDataGrid.execute_failed", error = error).to_string();
+                        data_grid.record_execution_failure(error, Some(executed_sql), cx);
+                        notification(cx, summary);
                     });
                 }
             }
@@ -2891,6 +3014,7 @@ impl Render for DataGrid {
                 div()
                     .flex_1()
                     .w_full()
+                    .h_full()
                     .overflow_hidden()
                     .child(self.render_table_area(window, cx)),
             )
@@ -2914,6 +3038,7 @@ impl Clone for DataGrid {
             _filter_sub: None,
             search_input: self.search_input.clone(),
             _search_sub: None,
+            execution_history: self.execution_history.clone(),
             is_large_text_editor_sidebar_open: self.is_large_text_editor_sidebar_open,
         }
     }
@@ -2938,11 +3063,13 @@ pub fn notification(cx: &mut App, error: String) {
 mod tests {
     use super::{
         DataGrid, ExportFormat, LargeTextEditorRoute, TableMetadata, build_header_order_by_clause,
-        build_large_text_editor_title, collect_delete_row_indices, resolve_large_text_editor_route,
-        table_has_unsaved_changes,
+        build_large_text_editor_title, collect_delete_row_indices, query_result_for_export,
+        resolve_large_text_editor_route, result_set_export_exec_options, table_has_unsaved_changes,
     };
     use crate::table_data::results_delegate::{CellChange, RowChange};
-    use db::{DbManager, TableCellValue, TableRowChange};
+    use db::{
+        DbManager, ExecResult, QueryResult, SqlErrorInfo, SqlResult, TableCellValue, TableRowChange,
+    };
     use gpui::SharedString;
     use one_core::settings::LargeTextCellEditorOpenMode;
     use one_core::storage::DatabaseType;
@@ -2959,6 +3086,62 @@ mod tests {
         let columns = vec![SharedString::from("id"), SharedString::from("body")];
         let metadata = TableMetadata::new("news").with_columns(vec!["id", "body"]);
         (rows, columns, metadata)
+    }
+
+    fn sample_query_result(row_count: usize) -> QueryResult {
+        QueryResult {
+            sql: "select id from users".to_string(),
+            columns: vec!["id".to_string()],
+            column_meta: vec![],
+            rows: (0..row_count)
+                .map(|row| vec![Some(row.to_string())])
+                .collect(),
+            binary_cells: vec![],
+            elapsed_ms: 0,
+        }
+    }
+
+    #[test]
+    fn result_set_export_disables_query_row_limit() {
+        assert_eq!(None, result_set_export_exec_options().max_rows);
+    }
+
+    #[test]
+    fn query_result_export_preserves_all_rows() {
+        let (_, rows) =
+            query_result_for_export(vec![SqlResult::Query(sample_query_result(1001))]).unwrap();
+        assert_eq!(1001, rows.len());
+    }
+
+    #[test]
+    fn query_result_export_rejects_non_query_and_ambiguous_results() {
+        let exec = SqlResult::Exec(ExecResult {
+            sql: "update users set active = true".to_string(),
+            rows_affected: 1,
+            elapsed_ms: 0,
+            message: None,
+        });
+        assert!(query_result_for_export(vec![exec]).is_err());
+
+        let database_error = "database unavailable";
+        let error = SqlResult::Error(SqlErrorInfo {
+            sql: "select id from users".to_string(),
+            message: database_error.to_string(),
+        });
+        assert!(
+            query_result_for_export(vec![error])
+                .unwrap_err()
+                .contains(database_error)
+        );
+
+        assert!(query_result_for_export(vec![]).is_err());
+        assert!(
+            query_result_for_export(vec![
+                SqlResult::Query(sample_query_result(1)),
+                SqlResult::Query(sample_query_result(1)),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

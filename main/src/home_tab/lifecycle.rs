@@ -59,9 +59,11 @@ impl HomePage {
 
         let mut page = Self {
             focus_handle: cx.focus_handle(),
+            home_active: true,
             selected_filter: ConnectionType::All,
             connection_layout: AppSettings::current(cx).home_connection_layout.into(),
             home_page_style: AppSettings::current(cx).home_page_style,
+            sidebar_collapsed: false,
             persistent_sidebar_expanded: AppSettings::current(cx).connection_sidebar_expanded,
             workspaces: Vec::new(),
             connections: Vec::new(),
@@ -86,7 +88,6 @@ impl HomePage {
             auth_error: None,
             master_key_unlock_prompt_pending: false,
             master_key_dialog_open: false,
-            sidebar_collapsed: false,
             team_permissions: TeamPermissionSnapshot::from_persisted_user_id(persisted_user_id),
             port_forwarding_runtime: Arc::new(
                 tokio::sync::Mutex::new(PortForwardingRuntime::new()),
@@ -188,8 +189,12 @@ impl HomePage {
                             this.trigger_sync(cx);
                         }
                     }
-                    ConnectionDataEvent::SchemaChanged { .. } => {
-                        // SchemaChanged 由 db_tree_view 处理，此处无需操作
+                    ConnectionDataEvent::CredentialCreated { .. }
+                    | ConnectionDataEvent::CredentialUpdated { .. }
+                    | ConnectionDataEvent::CredentialDeleted { .. }
+                    | ConnectionDataEvent::SchemaChanged { .. } => {
+                        // 钥匙串增量同步由 personal_sync_runtime 处理；
+                        // SchemaChanged 由 db_tree_view 处理，此处无需操作。
                     }
                     ConnectionDataEvent::CloudSyncRequested => {
                         this.trigger_sync(cx);
@@ -254,8 +259,11 @@ mod tests {
             .nth(1)
             .and_then(|source| source.split("\n        page\n").next())
             .expect("HomePage::new source");
+        let normalized_constructor = constructor.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        assert!(constructor.contains("let master_key_policy = startup_master_key_policy("));
+        assert!(
+            normalized_constructor.contains("let master_key_policy = startup_master_key_policy(")
+        );
         assert!(constructor.contains("master_key_policy.forget_persisted_key"));
         assert!(constructor.contains("master_key_policy.restore_from_storage"));
         assert!(constructor.contains("master_key_policy.prompt_for_unlock"));

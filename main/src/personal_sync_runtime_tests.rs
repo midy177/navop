@@ -90,7 +90,7 @@ fn personal_sync_maps_connection_update_to_local_change() {
     assert_eq!(
         Some(PersonalSyncEvent::LocalChanged {
             data_type: one_core::cloud_sync::data_type::CONNECTION.to_string(),
-            local_id: "82".to_string(),
+            local_id: "connection:82".to_string(),
         }),
         personal_sync_event_from_connection_event(&event)
     );
@@ -288,6 +288,7 @@ fn test_connection(id: i64) -> StoredConnection {
             port: 3306,
             username: String::new(),
             password: String::new(),
+            credential_reference: None,
             database: None,
             service_name: None,
             sid: None,

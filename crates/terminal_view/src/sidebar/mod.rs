@@ -33,12 +33,13 @@ use ai_chat_view::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, AnyView, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Styled, Subscription, Window, div,
+    AnyElement, AnyView, App, AppContext, ColorExt as _, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, SharedString, Styled,
+    Subscription, Window, div,
 };
 use gpui_component::{
     ActiveTheme, FunctionalIcon, Icon, IconName, IconSize, ObjectIcon, Selectable, Sizable, Size,
-    button::{IconButton, IconButtonRole},
+    button::{ButtonCustomVariant, ButtonVariants, IconButton, IconButtonRole},
     h_flex,
     panel_header::{PanelHeader, PanelHeaderVariant},
     v_flex,
@@ -114,6 +115,7 @@ fn terminal_ai_system_instruction(connection_kind: TerminalConnectionKind) -> St
         ),
         TerminalConnectionKind::Ssh => ("远程 Linux shell 环境".to_string(), "bash"),
         TerminalConnectionKind::Serial => ("串口终端环境".to_string(), "text"),
+        TerminalConnectionKind::Telnet => ("Telnet 网络设备终端环境".to_string(), "text"),
     };
     format!(
         r#"你是终端侧边栏中的命令助手，当前目标是{environment}。
@@ -327,10 +329,26 @@ fn terminal_toolbar_icon_button(
     panel: SidebarPanel,
     selected: bool,
     item_size: Size,
+    colors: &TerminalColors,
+    cx: &App,
 ) -> IconButton {
+    let style = if selected {
+        ButtonCustomVariant::new(cx)
+            .color(colors.accent)
+            .foreground(colors.accent_foreground)
+            .hover(colors.accent)
+            .active(colors.accent)
+    } else {
+        ButtonCustomVariant::new(cx)
+            .foreground(colors.foreground)
+            .hover(colors.muted)
+            .active(colors.muted)
+    };
+
     IconButton::new(id, panel.icon())
         .hit_size(item_size)
         .glyph_size(IconSize::Medium)
+        .custom(style)
         .selected(selected)
         .tooltip(panel.title())
 }
@@ -532,6 +550,8 @@ pub enum TerminalSidebarEvent {
     ScrollbackLinesChanged(usize),
     /// 粘贴命令到终端输入区（不自动回车）
     ExecuteCommand(String),
+    /// 快捷命令数据已变更
+    QuickCommandsChanged,
     /// 请求询问 AI
     AskAi,
     /// 粘贴代码到终端（用于AI生成的代码块）
@@ -542,6 +562,8 @@ pub enum TerminalSidebarEvent {
     ConfirmMultilinePasteChanged(bool),
     /// 高危命令确认开关
     ConfirmHighRiskCommandChanged(bool),
+    /// 自动会话日志开关
+    AutoSessionLoggingChanged(bool),
     /// 选中自动复制开关
     AutoCopyChanged(bool),
     /// 自动补全开关
@@ -781,6 +803,9 @@ impl TerminalSidebar {
                         *enabled,
                     ));
                 }
+                settings_panel::SettingsPanelEvent::AutoSessionLoggingChanged(enabled) => {
+                    cx.emit(TerminalSidebarEvent::AutoSessionLoggingChanged(*enabled));
+                }
                 settings_panel::SettingsPanelEvent::AutoCopyChanged(enabled) => {
                     cx.emit(TerminalSidebarEvent::AutoCopyChanged(*enabled));
                 }
@@ -818,6 +843,9 @@ impl TerminalSidebar {
                 }
                 quick_command_panel::QuickCommandPanelEvent::ExecuteCommand(cmd) => {
                     cx.emit(TerminalSidebarEvent::ExecuteCommand(cmd.clone()));
+                }
+                quick_command_panel::QuickCommandPanelEvent::QuickCommandsChanged => {
+                    cx.emit(TerminalSidebarEvent::QuickCommandsChanged);
                 }
             },
         );
@@ -1358,6 +1386,8 @@ impl TerminalSidebar {
             panel,
             is_active,
             item_size,
+            &self.colors,
+            cx,
         )
         .on_click(cx.listener(move |this, _event, _window, cx| {
             this.toggle_panel(panel, cx);
@@ -1483,6 +1513,8 @@ impl TerminalSidebarToolbar {
         &self,
         button: TerminalToolbarButtonSnapshot,
         item_size: Size,
+        colors: &TerminalColors,
+        cx: &App,
     ) -> impl IntoElement {
         let sidebar = self.sidebar.clone();
         let panel = button.panel;
@@ -1492,6 +1524,8 @@ impl TerminalSidebarToolbar {
             panel,
             button.open,
             item_size,
+            colors,
+            cx,
         )
         .on_click(move |_, _window, cx| {
             sidebar.update(cx, |sidebar, cx| {
@@ -1519,7 +1553,7 @@ impl Render for TerminalSidebarToolbar {
                         .buttons
                         .iter()
                         .copied()
-                        .map(|button| self.render_button(button, item_size)),
+                        .map(|button| self.render_button(button, item_size, &snapshot.colors, cx)),
                 ),
             )
     }
@@ -1594,6 +1628,7 @@ mod tests {
     use gpui_component::{Theme, ThemeColor};
     use one_core::sidebar_contribution::SidebarPlacement;
     use one_core::storage::{ConnectionType, StoredConnection};
+    use palette::IntoColor as _;
     use terminal::terminal::TerminalConnectionKind;
 
     fn stored_connection(id: i64, name: &str, connection_type: ConnectionType) -> StoredConnection {
@@ -1760,13 +1795,13 @@ mod tests {
     #[test]
     fn workspace_theme_maps_terminal_palette_and_application_semantic_colors() {
         let colors = TerminalColors {
-            background: rgb(0x101010).into(),
-            foreground: rgb(0xf0f0f0).into(),
-            muted: rgb(0x202020).into(),
-            muted_foreground: rgb(0x909090).into(),
-            border: rgb(0x303030).into(),
-            accent: rgb(0x3366ff).into(),
-            accent_foreground: rgb(0xffffff).into(),
+            background: rgb(0x101010).into_color(),
+            foreground: rgb(0xf0f0f0).into_color(),
+            muted: rgb(0x202020).into_color(),
+            muted_foreground: rgb(0x909090).into_color(),
+            border: rgb(0x303030).into_color(),
+            accent: rgb(0x3366ff).into_color(),
+            accent_foreground: rgb(0xffffff).into_color(),
         };
         let application_theme = Theme::from(ThemeColor::dark().as_ref());
 

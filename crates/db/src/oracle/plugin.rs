@@ -21,7 +21,10 @@ use crate::manifest_helpers::{
     ssh_password_field, tab, yes_no_options,
 };
 use crate::oracle::connection::OracleDbConnection;
-use crate::plugin::{DatabasePlugin, DatabaseUserOperationRequest, SqlCompletionInfo};
+use crate::plugin::{
+    DatabasePlugin, DatabaseUserOperationRequest, PaginatedQuery, SqlCompletionInfo,
+    parse_table_data_total_count,
+};
 use crate::plugin_manifest::{
     DatabaseActionId, DatabaseActionManifest, DatabaseActionPlacement, DatabaseActionToolbarScope,
     DatabaseCapabilities, DatabaseFormFieldType, DatabaseFormKind, DatabaseFormManifest,
@@ -70,6 +73,7 @@ const ORACLE_DATETIME_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS";
 const ORACLE_DATETIME_FRACTION_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS.FF6";
 const ORACLE_DATETIME_TZ_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS TZH:TZM";
 const ORACLE_DATETIME_TZ_FRACTION_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM";
+const ORACLE_PAGINATION_ROWNUM_COLUMN: &str = "__navop_pagination_rownum__";
 
 impl OraclePlugin {
     pub fn new() -> Self {
@@ -1065,6 +1069,30 @@ impl DatabasePlugin for OraclePlugin {
         "ROWID"
     }
 
+    fn build_paginated_query(
+        &self,
+        base_sql: &str,
+        limit: usize,
+        offset: usize,
+        _order_clause: &str,
+    ) -> PaginatedQuery {
+        if offset == 0 {
+            return PaginatedQuery::new(format!(
+                "SELECT * FROM ({base_sql}) WHERE ROWNUM <= {limit}"
+            ));
+        }
+
+        let end_row = offset.saturating_add(limit);
+        PaginatedQuery::new(format!(
+            "SELECT * FROM (\
+             SELECT navop_page_.*, ROWNUM AS \"{ORACLE_PAGINATION_ROWNUM_COLUMN}\" \
+             FROM ({base_sql}) navop_page_ \
+             WHERE ROWNUM <= {end_row}\
+             ) WHERE \"{ORACLE_PAGINATION_ROWNUM_COLUMN}\" > {offset}"
+        ))
+        .with_hidden_result_column(ORACLE_PAGINATION_ROWNUM_COLUMN)
+    }
+
     fn format_table_reference(&self, _database: &str, schema: Option<&str>, table: &str) -> String {
         match schema {
             Some(s) => format!(
@@ -1107,7 +1135,7 @@ impl DatabasePlugin for OraclePlugin {
             Some(ref c) if !c.trim().is_empty() => format!(" ORDER BY {}", c.trim()),
             _ => String::new(),
         };
-        let offset = (request.page.saturating_sub(1)) * request.page_size;
+        let offset = request.effective_offset();
 
         let table_ref = self.format_table_reference(
             &request.database,
@@ -1115,17 +1143,12 @@ impl DatabasePlugin for OraclePlugin {
             &request.table,
         );
 
-        let count_sql = format!("SELECT COUNT(*) FROM {}{}", table_ref, where_clause);
-
-        let total_count = match connection.query(&count_sql).await? {
-            SqlResult::Query(result) => result
-                .rows
-                .first()
-                .and_then(|r| r.first())
-                .and_then(|v| v.as_ref())
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0),
-            _ => 0,
+        let total_count = match request.known_total_count {
+            Some(total_count) => total_count,
+            None => {
+                let count_sql = format!("SELECT COUNT(*) FROM {}{}", table_ref, where_clause);
+                parse_table_data_total_count(connection.query(&count_sql).await?)?
+            }
         };
 
         let order_by = if order_clause.is_empty() {
@@ -1134,19 +1157,21 @@ impl DatabasePlugin for OraclePlugin {
             order_clause.clone()
         };
 
-        let data_sql = format!(
-            "SELECT ROWID AS \"__rowid__\", t.* FROM {} t{}{} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-            table_ref, where_clause, order_by, offset, request.page_size
+        let base_sql = format!(
+            "SELECT ROWID AS \"__rowid__\", t.* FROM {table_ref} t{where_clause}{order_by}"
         );
+        let paginated_query =
+            self.build_paginated_query(&base_sql, request.page_size, offset, &order_by);
 
-        let sql_result = connection.query(&data_sql).await?;
+        let sql_result = connection.query(&paginated_query.sql).await?;
         let duration = start_time.elapsed().as_millis();
 
-        let query_result = match sql_result {
+        let mut query_result = match sql_result {
             SqlResult::Query(query_result) => Ok::<QueryResult, anyhow::Error>(query_result),
             SqlResult::Exec(_) => anyhow::bail!(t!("Error.query_type_error")),
             SqlResult::Error(sql_error_info) => anyhow::bail!(sql_error_info.message),
         }?;
+        paginated_query.strip_hidden_result_columns(&mut query_result)?;
 
         Ok(TableDataResponse {
             query_result,
@@ -1485,6 +1510,7 @@ impl DatabasePlugin for OraclePlugin {
                 .iter()
                 .map(|row| TableInfo {
                     name: row.get(0).and_then(|v| v.clone()).unwrap_or_default(),
+                    object_type: crate::TableObjectType::Table,
                     schema: Some(schema.to_string()),
                     comment: row.get(1).and_then(|v| v.clone()),
                     engine: None,
@@ -1931,6 +1957,16 @@ impl DatabasePlugin for OraclePlugin {
         }
     }
 
+    async fn list_functions_in_schema(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+        schema: Option<String>,
+    ) -> Result<Vec<FunctionInfo>> {
+        let schema = schema.unwrap_or_else(|| database.to_string());
+        self.list_functions(connection, &schema).await
+    }
+
     async fn list_functions_view(
         &self,
         connection: &dyn DbConnection,
@@ -2034,6 +2070,16 @@ impl DatabasePlugin for OraclePlugin {
         }
     }
 
+    async fn list_procedures_in_schema(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+        schema: Option<String>,
+    ) -> Result<Vec<FunctionInfo>> {
+        let schema = schema.unwrap_or_else(|| database.to_string());
+        self.list_procedures(connection, &schema).await
+    }
+
     async fn list_procedures_view(
         &self,
         connection: &dyn DbConnection,
@@ -2135,6 +2181,16 @@ impl DatabasePlugin for OraclePlugin {
         } else {
             Ok(vec![])
         }
+    }
+
+    async fn list_triggers_in_schema(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+        schema: Option<String>,
+    ) -> Result<Vec<TriggerInfo>> {
+        let schema = schema.unwrap_or_else(|| database.to_string());
+        self.list_triggers(connection, &schema).await
     }
 
     async fn list_triggers_view(
@@ -2553,11 +2609,19 @@ ORDER BY username;"#
             .map(|column| self.quote_identifier(column))
             .collect::<Vec<_>>()
             .join(", ");
+        let referenced_table = match foreign_key.ref_schema.as_deref() {
+            Some(schema) if !schema.trim().is_empty() => format!(
+                "{}.{}",
+                self.quote_identifier(schema),
+                self.quote_identifier(&foreign_key.ref_table)
+            ),
+            _ => self.quote_identifier(&foreign_key.ref_table),
+        };
         let mut definition = format!(
             "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
             self.quote_identifier(&foreign_key.name),
             columns,
-            self.quote_identifier(&foreign_key.ref_table),
+            referenced_table,
             ref_columns
         );
         if let Some(action) = Self::foreign_key_delete_action_sql(&foreign_key.on_delete) {
@@ -2573,6 +2637,7 @@ ORDER BY username;"#
     ) -> bool {
         left.columns != right.columns
             || left.ref_table != right.ref_table
+            || left.ref_schema != right.ref_schema
             || left.ref_columns != right.ref_columns
             || Self::foreign_key_delete_action_sql(&left.on_delete)
                 != Self::foreign_key_delete_action_sql(&right.on_delete)
@@ -2845,6 +2910,91 @@ mod tests {
 
     fn create_plugin() -> OraclePlugin {
         OraclePlugin::new()
+    }
+
+    #[test]
+    fn table_data_pagination_uses_oracle_11g_compatible_rownum() {
+        let paginated_query = create_plugin().build_paginated_query(
+            "SELECT ROWID AS \"__rowid__\", t.* FROM \"APP\".\"USERS\" t WHERE active = 1 ORDER BY created_at DESC",
+            10,
+            20,
+            " ORDER BY created_at DESC",
+        );
+        let sql = paginated_query.sql;
+
+        assert!(!sql.contains("OFFSET"));
+        assert!(!sql.contains("FETCH NEXT"));
+        assert!(sql.contains(
+            "SELECT ROWID AS \"__rowid__\", t.* FROM \"APP\".\"USERS\" t WHERE active = 1 ORDER BY created_at DESC"
+        ));
+        assert!(sql.contains("WHERE ROWNUM <= 30"));
+        assert!(sql.contains("\"__navop_pagination_rownum__\" > 20"));
+    }
+
+    #[test]
+    fn first_page_pagination_does_not_expose_an_internal_column() {
+        let paginated_query =
+            create_plugin().build_paginated_query("SELECT * FROM \"USERS\"", 10, 0, "");
+
+        assert_eq!(
+            paginated_query.sql,
+            "SELECT * FROM (SELECT * FROM \"USERS\") WHERE ROWNUM <= 10"
+        );
+
+        let mut query_result = QueryResult {
+            sql: paginated_query.sql.clone(),
+            columns: vec!["id".to_string()],
+            column_meta: vec![],
+            rows: vec![vec![Some("42".to_string())]],
+            binary_cells: vec![],
+            elapsed_ms: 0,
+        };
+        paginated_query
+            .strip_hidden_result_columns(&mut query_result)
+            .unwrap();
+        assert_eq!(query_result.columns, vec!["id"]);
+    }
+
+    #[test]
+    fn table_data_pagination_removes_internal_rownum_column() {
+        let paginated_query =
+            create_plugin().build_paginated_query("SELECT * FROM \"USERS\"", 10, 20, "");
+        let mut query_result = QueryResult {
+            sql: "test".to_string(),
+            columns: vec![
+                "__rowid__".to_string(),
+                "id".to_string(),
+                ORACLE_PAGINATION_ROWNUM_COLUMN.to_string(),
+            ],
+            column_meta: vec![
+                crate::executor::QueryColumnMeta::new("__rowid__", "ROWID"),
+                crate::executor::QueryColumnMeta::new("id", "NUMBER"),
+                crate::executor::QueryColumnMeta::new(ORACLE_PAGINATION_ROWNUM_COLUMN, "NUMBER"),
+            ],
+            rows: vec![vec![
+                Some("AAABBB".to_string()),
+                Some("42".to_string()),
+                Some("21".to_string()),
+            ]],
+            binary_cells: vec![crate::executor::BinaryCell {
+                row_index: 0,
+                column_index: 1,
+                bytes: vec![42],
+            }],
+            elapsed_ms: 0,
+        };
+
+        paginated_query
+            .strip_hidden_result_columns(&mut query_result)
+            .unwrap();
+
+        assert_eq!(query_result.columns, vec!["__rowid__", "id"]);
+        assert_eq!(
+            query_result.rows,
+            vec![vec![Some("AAABBB".to_string()), Some("42".to_string())]]
+        );
+        assert_eq!(query_result.column_meta.len(), 2);
+        assert_eq!(query_result.binary_cells[0].column_index, 1);
     }
 
     fn user_request(
@@ -3465,6 +3615,7 @@ mod tests {
                 name: "fk_order_items_order".to_string(),
                 columns: vec!["order_id".to_string()],
                 ref_table: "orders".to_string(),
+                ref_schema: None,
                 ref_columns: vec!["id".to_string()],
                 on_delete: "CASCADE".to_string(),
                 on_update: String::new(),
@@ -3494,6 +3645,7 @@ mod tests {
                 name: "fk_order_items_order".to_string(),
                 columns: vec!["order_id".to_string()],
                 ref_table: "orders".to_string(),
+                ref_schema: None,
                 ref_columns: vec!["id".to_string()],
                 on_delete: "SET NULL".to_string(),
                 on_update: "CASCADE".to_string(),
@@ -3735,6 +3887,7 @@ mod tests {
                 name: "fk_order_items_legacy".to_string(),
                 columns: vec!["legacy_order_id".to_string()],
                 ref_table: "orders".to_string(),
+                ref_schema: None,
                 ref_columns: vec!["id".to_string()],
                 on_delete: String::new(),
                 on_update: String::new(),
@@ -3753,6 +3906,7 @@ mod tests {
                 name: "fk_order_items_order".to_string(),
                 columns: vec!["order_id".to_string()],
                 ref_table: "orders".to_string(),
+                ref_schema: None,
                 ref_columns: vec!["id".to_string()],
                 on_delete: "CASCADE".to_string(),
                 on_update: String::new(),

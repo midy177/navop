@@ -11,6 +11,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::metadata_cache::{CacheKey, MetadataCacheManager};
+use crate::streaming_parser::StreamingSqlParser;
+use one_core::storage::DatabaseType;
 
 /// DDL 关键字列表，用于粗粒度兜底检测
 const DDL_KEYWORDS: &[&str] = &["CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME"];
@@ -138,9 +140,110 @@ impl DdlInvalidator {
 
     /// 解析 SQL 中的所有 DDL 事件（支持多语句）
     ///
-    /// 优先使用 sqlparser AST 解析，失败时 fallback 到字符串匹配。
+    /// 先按语句筛选 DDL 候选，再优先使用 sqlparser AST 解析，
+    /// 失败时 fallback 到字符串匹配。
     /// 如果 SQL 包含 DDL 关键字但无法解析，执行粗粒度兜底（失效整个数据库级缓存）。
     pub fn parse_ddl_events(
+        sql: &str,
+        current_database: &str,
+        current_schema: Option<&str>,
+    ) -> Vec<DdlEvent> {
+        Self::parse_ddl_events_for_database(
+            sql,
+            current_database,
+            current_schema,
+            &DatabaseType::MySQL,
+        )
+    }
+
+    /// 使用数据库方言解析 SQL 中的所有 DDL 事件（支持多语句）。
+    ///
+    /// 先用流式语句切分器线性扫描脚本，只把以 DDL 关键字开头的语句交给
+    /// sqlparser 构建 AST。这样包含超大 INSERT/UPDATE 的混合脚本不会为了缓存
+    /// 失效而再次构建完整 DML AST。
+    pub fn parse_ddl_events_for_database(
+        sql: &str,
+        current_database: &str,
+        current_schema: Option<&str>,
+        database_type: &DatabaseType,
+    ) -> Vec<DdlEvent> {
+        let candidates = match Self::ddl_candidates(sql, database_type) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                warn!(
+                    "Failed to split SQL while detecting DDL, falling back to full parsing: {error}"
+                );
+                return Self::parse_ddl_candidate(sql, current_database, current_schema);
+            }
+        };
+
+        candidates
+            .iter()
+            .flat_map(|statement| {
+                Self::parse_ddl_candidate(statement, current_database, current_schema)
+            })
+            .collect()
+    }
+
+    fn ddl_candidates(sql: &str, database_type: &DatabaseType) -> std::io::Result<Vec<String>> {
+        let parser = StreamingSqlParser::from_script(sql.to_string(), database_type.clone())?;
+        let mut candidates = Vec::new();
+
+        for statement in parser {
+            let statement = statement?;
+            if Self::starts_with_ddl_keyword(&statement) {
+                candidates.push(statement);
+            }
+        }
+
+        Ok(candidates)
+    }
+
+    fn starts_with_ddl_keyword(sql: &str) -> bool {
+        let mut remaining =
+            sql.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}');
+
+        loop {
+            if let Some(comment) = remaining.strip_prefix("--") {
+                remaining = comment
+                    .find('\n')
+                    .map(|end| &comment[end + 1..])
+                    .unwrap_or_default()
+                    .trim_start();
+                continue;
+            }
+
+            if let Some(comment) = remaining.strip_prefix('#') {
+                remaining = comment
+                    .find('\n')
+                    .map(|end| &comment[end + 1..])
+                    .unwrap_or_default()
+                    .trim_start();
+                continue;
+            }
+
+            if let Some(comment) = remaining.strip_prefix("/*") {
+                let Some(end) = comment.find("*/") else {
+                    return false;
+                };
+                remaining = comment[end + 2..].trim_start();
+                continue;
+            }
+
+            break;
+        }
+
+        let first_word = remaining
+            .split_once(|ch: char| !ch.is_ascii_alphabetic())
+            .map(|(word, _)| word)
+            .unwrap_or(remaining);
+
+        DDL_KEYWORDS
+            .iter()
+            .any(|keyword| first_word.eq_ignore_ascii_case(keyword))
+    }
+
+    fn parse_ddl_candidate(
         sql: &str,
         current_database: &str,
         current_schema: Option<&str>,
@@ -879,6 +982,11 @@ impl DdlInvalidator {
                 // 失效视图列表缓存
                 let key = CacheKey::views(connection_id, database, schema.as_deref());
                 cache.invalidate(&key).await;
+                // 部分数据库（例如 MySQL）的表列表会同时返回表和视图。
+                // 创建、替换或删除视图后必须同步失效，否则结构比较可能继续使用旧对象列表。
+                cache
+                    .invalidate_table_list(connection_id, database, schema.as_deref())
+                    .await;
             }
 
             DdlEvent::CreateFunction { database, .. } | DdlEvent::DropFunction { database, .. } => {
@@ -939,6 +1047,46 @@ impl DdlInvalidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_cache::{CacheLevel, MetadataCacheConfig, MetadataEntry};
+
+    fn memory_only_cache() -> Arc<MetadataCacheManager> {
+        let cache_dir = tempfile::tempdir().unwrap().keep();
+        let config = MetadataCacheConfig {
+            enable_file_cache: false,
+            ..MetadataCacheConfig::default()
+        };
+        Arc::new(MetadataCacheManager::with_config(cache_dir, config).unwrap())
+    }
+
+    async fn assert_view_event_invalidates_view_and_table_lists(event: DdlEvent) {
+        let cache = memory_only_cache();
+        let invalidator = DdlInvalidator::new(cache.clone());
+        let tables_key = CacheKey::tables("connection", "database", Some("public"));
+        let views_key = CacheKey::views("connection", "database", Some("public"));
+
+        cache
+            .set(
+                &tables_key,
+                MetadataEntry::Tables(Vec::new()),
+                CacheLevel::Database,
+            )
+            .await;
+        cache
+            .set(
+                &views_key,
+                MetadataEntry::Views(Vec::new()),
+                CacheLevel::Database,
+            )
+            .await;
+
+        assert!(cache.get(&tables_key).await.is_some());
+        assert!(cache.get(&views_key).await.is_some());
+
+        invalidator.invalidate("connection", &event).await;
+
+        assert!(cache.get(&tables_key).await.is_none());
+        assert!(cache.get(&views_key).await.is_none());
+    }
 
     #[test]
     fn test_parse_create_table() {
@@ -1025,6 +1173,26 @@ mod tests {
         assert!(matches!(event, Some(DdlEvent::CreateView { view, .. }) if view == "active_users"));
     }
 
+    #[tokio::test]
+    async fn create_view_invalidates_view_and_table_lists() {
+        assert_view_event_invalidates_view_and_table_lists(DdlEvent::CreateView {
+            database: "database".to_string(),
+            schema: Some("public".to_string()),
+            view: "active_users".to_string(),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn drop_view_invalidates_view_and_table_lists() {
+        assert_view_event_invalidates_view_and_table_lists(DdlEvent::DropView {
+            database: "database".to_string(),
+            schema: Some("public".to_string()),
+            view: "active_users".to_string(),
+        })
+        .await;
+    }
+
     #[test]
     fn test_parse_create_function() {
         let event = DdlInvalidator::parse_ddl_event(
@@ -1109,6 +1277,89 @@ mod tests {
         let events = DdlInvalidator::parse_ddl_events(sql, "mydb", None);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], DdlEvent::CreateTable { table, .. } if table == "users"));
+    }
+
+    #[test]
+    fn test_large_insert_is_not_a_ddl_parse_candidate() {
+        let mut sql =
+            String::from("DROP TABLE IF EXISTS users; CREATE TABLE users (id INT, name TEXT);");
+        sql.push_str(" INSERT INTO users VALUES ");
+        for row in 0..5_717 {
+            if row > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!(
+                "({row}, 'CREATE TABLE ignored_{row}; DROP TABLE ignored')"
+            ));
+        }
+        sql.push(';');
+
+        let candidates =
+            DdlInvalidator::ddl_candidates(&sql, &DatabaseType::MySQL).expect("split SQL");
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates[0].starts_with("DROP TABLE"));
+        assert!(candidates[1].starts_with("CREATE TABLE"));
+        assert!(
+            candidates
+                .iter()
+                .all(|statement| !statement.starts_with("INSERT"))
+        );
+
+        let events =
+            DdlInvalidator::parse_ddl_events_for_database(&sql, "mydb", None, &DatabaseType::MySQL);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], DdlEvent::DropTable { table, .. } if table == "users"));
+        assert!(matches!(&events[1], DdlEvent::CreateTable { table, .. } if table == "users"));
+    }
+
+    #[test]
+    fn test_ddl_after_dml_is_still_detected() {
+        let sql = r#"
+            INSERT INTO audit_log(message) VALUES ('CREATE TABLE fake (id INT)');
+            UPDATE audit_log SET message = 'DROP TABLE fake';
+            /* CREATE TABLE commented_out (id INT); */
+            CREATE TABLE real_table (id INT);
+        "#;
+
+        let candidates =
+            DdlInvalidator::ddl_candidates(sql, &DatabaseType::MySQL).expect("split SQL");
+        assert_eq!(candidates.len(), 1, "candidates: {candidates:#?}");
+
+        let events =
+            DdlInvalidator::parse_ddl_events_for_database(sql, "mydb", None, &DatabaseType::MySQL);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], DdlEvent::CreateTable { table, .. } if table == "real_table"));
+    }
+
+    #[test]
+    fn test_mysql_delimiter_and_postgres_dollar_quotes_preserve_statement_boundaries() {
+        let mysql_sql = "\
+            DELIMITER $$\n\
+            CREATE PROCEDURE refresh_users()\n\
+            BEGIN\n\
+              INSERT INTO users VALUES (1, 'DROP TABLE fake;');\n\
+            END$$\n\
+            DELIMITER ;\n\
+            INSERT INTO users VALUES (2, 'CREATE TABLE fake');";
+        let mysql_candidates =
+            DdlInvalidator::ddl_candidates(mysql_sql, &DatabaseType::MySQL).expect("split MySQL");
+        assert_eq!(mysql_candidates.len(), 1);
+        assert!(mysql_candidates[0].starts_with("CREATE PROCEDURE"));
+        assert!(mysql_candidates[0].contains("DROP TABLE fake;"));
+
+        let postgres_sql = "\
+            CREATE FUNCTION refresh_users() RETURNS void AS $body$\n\
+            BEGIN\n\
+              PERFORM 'DROP TABLE fake;';\n\
+            END;\n\
+            $body$ LANGUAGE plpgsql;\n\
+            INSERT INTO users VALUES ('CREATE TABLE fake');";
+        let postgres_candidates =
+            DdlInvalidator::ddl_candidates(postgres_sql, &DatabaseType::PostgreSQL)
+                .expect("split PostgreSQL");
+        assert_eq!(postgres_candidates.len(), 1);
+        assert!(postgres_candidates[0].starts_with("CREATE FUNCTION"));
+        assert!(postgres_candidates[0].contains("DROP TABLE fake;"));
     }
 
     #[test]

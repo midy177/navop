@@ -1,8 +1,35 @@
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// 数据比较的单元格值
 pub type CellValue = serde_json::Value;
+
+/// Tagged JSON object used to preserve binary query cells through the
+/// database-agnostic row comparison model.
+pub(crate) const BINARY_CELL_TAG: &str = "$navop_binary";
+
+pub(crate) fn binary_cell_value(bytes: &[u8]) -> CellValue {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        BINARY_CELL_TAG.to_string(),
+        CellValue::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
+    );
+    CellValue::Object(object)
+}
+
+pub(crate) fn binary_cell_bytes(value: &CellValue) -> Option<Vec<u8>> {
+    let CellValue::Object(object) = value else {
+        return None;
+    };
+    if object.len() != 1 {
+        return None;
+    }
+    let encoded = object.get(BINARY_CELL_TAG)?.as_str()?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .ok()
+}
 
 /// 数据比较的行数据（列名 -> 值）
 pub type RowData = HashMap<String, CellValue>;
@@ -11,7 +38,7 @@ pub type RowData = HashMap<String, CellValue>;
 pub type KeyValues = HashMap<String, CellValue>;
 
 /// 数据比较结果
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DataCompareResult {
     /// 源表名
     pub source_table: String,
@@ -31,6 +58,15 @@ pub struct DataCompareResult {
     pub source_truncated: bool,
     /// 目标端是否被截断（未全量比较）
     pub target_truncated: bool,
+    /// 目标表是否不存在（缺失目标表时，同步计划需前置 CREATE TABLE）
+    #[serde(default)]
+    pub target_table_missing: bool,
+    /// 目标表的列类型映射（列名 -> 数据库类型，用于生成类型感知的字面量）
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub column_types: HashMap<String, String>,
+    /// 缺失目标表时的源表结构（用于按目标方言生成建表语句）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_target_schema: Option<super::TableSchema>,
 }
 
 /// 修改行的详细信息

@@ -16,7 +16,9 @@ on:
           - macos-arm64
           - macos-x64
           - linux-x64
+          - linux-x64-portable
           - linux-arm64
+          - linux-arm64-portable
           - windows-x64
           - windows-x86
 
@@ -112,19 +114,23 @@ jobs:
           RELEASE_PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
-          macos_arm64='{"target":"aarch64-apple-darwin","os":"macos-latest","binary":"navop","archive":"navop-aarch64-apple-darwin.tar.gz","arm_linux":false}'
-          macos_x64='{"target":"x86_64-apple-darwin","os":"macos-15-intel","binary":"navop","archive":"navop-x86_64-apple-darwin.tar.gz","arm_linux":false}'
-          linux_x64='{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-latest","binary":"navop","archive":"navop-x86_64-unknown-linux-gnu.tar.gz","arm_linux":false}'
-          linux_arm64='{"target":"aarch64-unknown-linux-gnu","os":"ubuntu-24.04-arm","binary":"navop","archive":"navop-aarch64-unknown-linux-gnu.tar.gz","arm_linux":true}'
-          windows_x64='{"target":"x86_64-pc-windows-msvc","os":"windows-latest","binary":"navop.exe","archive":"navop-x86_64-pc-windows-msvc.zip","arm_linux":false,"windows_arch":"x64","windows_basename":"navop-x86_64-pc-windows-msvc"}'
-          windows_x86='{"target":"i686-pc-windows-msvc","os":"windows-latest","binary":"navop.exe","archive":"navop-i686-pc-windows-msvc.zip","arm_linux":false,"windows_arch":"x86","windows_basename":"navop-i686-pc-windows-msvc"}'
+          macos_arm64='{"target":"aarch64-apple-darwin","os":"macos-latest","binary":"navop","archive":"navop-aarch64-apple-darwin.tar.gz","variant":"standard","arm_linux":false,"windows_native_rdp":false,"portable_linux":false}'
+          macos_x64='{"target":"x86_64-apple-darwin","os":"macos-15-intel","binary":"navop","archive":"navop-x86_64-apple-darwin.tar.gz","variant":"standard","arm_linux":false,"windows_native_rdp":false,"portable_linux":false}'
+          linux_x64='{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-latest","binary":"navop","archive":"navop-x86_64-unknown-linux-gnu.tar.gz","variant":"standard","arm_linux":false,"windows_native_rdp":false,"portable_linux":false}'
+          linux_x64_portable='{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-22.04","binary":"navop","archive":"navop-x86_64-unknown-linux-gnu-portable.tar.gz","variant":"portable","arm_linux":false,"windows_native_rdp":false,"portable_linux":true}'
+          linux_arm64='{"target":"aarch64-unknown-linux-gnu","os":"ubuntu-24.04-arm","binary":"navop","archive":"navop-aarch64-unknown-linux-gnu.tar.gz","variant":"standard","arm_linux":true,"windows_native_rdp":false,"portable_linux":false}'
+          linux_arm64_portable='{"target":"aarch64-unknown-linux-gnu","os":"ubuntu-24.04-arm","binary":"navop","archive":"navop-aarch64-unknown-linux-gnu-portable.tar.gz","variant":"portable","arm_linux":true,"windows_native_rdp":false,"portable_linux":true}'
+          windows_x64='{"target":"x86_64-pc-windows-msvc","os":"windows-latest","binary":"navop.exe","archive":"navop-x86_64-pc-windows-msvc.zip","variant":"standard","arm_linux":false,"windows_native_rdp":true,"portable_linux":false,"windows_arch":"x64","windows_basename":"navop-x86_64-pc-windows-msvc"}'
+          windows_x86='{"target":"i686-pc-windows-msvc","os":"windows-latest","binary":"navop.exe","archive":"navop-i686-pc-windows-msvc.zip","variant":"standard","arm_linux":false,"windows_native_rdp":true,"portable_linux":false,"windows_arch":"x86","windows_basename":"navop-i686-pc-windows-msvc"}'
 
           case "$RELEASE_PLATFORM" in
-            all) matrix="[$macos_arm64,$macos_x64,$linux_x64,$linux_arm64,$windows_x64,$windows_x86]" ;;
+            all) matrix="[$macos_arm64,$macos_x64,$linux_x64,$linux_x64_portable,$linux_arm64,$linux_arm64_portable,$windows_x64,$windows_x86]" ;;
             macos-arm64) matrix="[$macos_arm64]" ;;
             macos-x64) matrix="[$macos_x64]" ;;
-            linux-x64) matrix="[$linux_x64]" ;;
-            linux-arm64) matrix="[$linux_arm64]" ;;
+            linux-x64) matrix="[$linux_x64,$linux_x64_portable]" ;;
+            linux-x64-portable) matrix="[$linux_x64_portable]" ;;
+            linux-arm64) matrix="[$linux_arm64,$linux_arm64_portable]" ;;
+            linux-arm64-portable) matrix="[$linux_arm64_portable]" ;;
             windows-x64) matrix="[$windows_x64]" ;;
             windows-x86) matrix="[$windows_x86]" ;;
             *) echo "::error::Unsupported platform: $RELEASE_PLATFORM"; exit 1 ;;
@@ -132,7 +138,7 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.target }} / ${{ matrix.variant }})
     needs: prepare
     strategy:
       fail-fast: false
@@ -217,6 +223,48 @@ jobs:
         shell: pwsh
         run: |
           cmake --version
+          choco install nasm --no-progress --yes
+          $nasmDir = Join-Path $env:ProgramFiles "NASM"
+          $nasmExe = Join-Path $nasmDir "nasm.exe"
+          if (-not (Test-Path -LiteralPath $nasmExe -PathType Leaf)) {
+            throw "NASM executable was not found at '$nasmExe'"
+          }
+          $env:Path = "$nasmDir;$env:Path"
+          $nasmDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          nasm -v
+
+      - name: Install Zig toolchain (portable Linux)
+        if: matrix.portable_linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/ziglang"
+          "$RUNNER_TEMP/ziglang/bin/python" -m pip install ziglang==0.14.1
+          cargo install --locked cargo-zigbuild --version 0.23.0
+          echo "CARGO_ZIGBUILD_PYTHON_PATH=$RUNNER_TEMP/ziglang/bin/python" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/ziglang/bin/python" -m ziglang version
+          cargo-zigbuild --version
+
+      - name: Install portable packaging dependencies
+        if: matrix.portable_linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y binutils musl-tools
+
+      - name: Build Windows RDP toolchain probe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          ./script/build-windows-rdp-probe.ps1
+          -Target "${{ matrix.target }}"
+
+      - name: Configure MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.windows_arch }}
 
       - name: Set environment variables
         shell: bash
@@ -259,7 +307,34 @@ jobs:
           echo "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}"
           echo "CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO:-}"
           echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}"
-          cargo build --release -p main --target ${{ matrix.target }}
+          if [ "${{ matrix.portable_linux }}" = "true" ]; then
+            cargo zigbuild \
+              --release \
+              -p main \
+              --target "${{ matrix.target }}.2.28" \
+              --no-default-features \
+              --features wasm-components
+          elif [ "${{ matrix.windows_native_rdp }}" = "true" ]; then
+            if [ -z "${VCToolsInstallDir:-}" ]; then
+              echo "::error::VCToolsInstallDir is not configured"
+              exit 1
+            fi
+            cargo_features=()
+            cargo_features+=(--features windows-native-rdp)
+            cargo build --release -p main "${cargo_features[@]}" --target ${{ matrix.target }}
+          else
+            cargo build --release -p main --target "${{ matrix.target }}"
+          fi
+          test -x "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+      - name: Verify portable Linux glibc baseline
+        if: matrix.portable_linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          script/check-linux-glibc-baseline.sh \
+            "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+            "2.28"
 
       - name: Save shared Cargo inputs
         if: >-
@@ -298,29 +373,50 @@ jobs:
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
+        shell: bash
         run: |
-          mkdir -p package/usr/bin
+          set -euo pipefail
+          rm -rf package
+
+          if [ "${{ matrix.portable_linux }}" = "true" ]; then
+            script/package-linux-portable.sh \
+              --binary "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+              --output package \
+              --launcher-source script/linux-portable-launcher.c \
+              --target "${{ matrix.target }}" \
+              --glibc-baseline "2.28"
+          else
+            mkdir -p package/usr/bin
+            cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" package/usr/bin/
+          fi
+
           mkdir -p package/usr/share/applications
           mkdir -p package/usr/share/mime/packages
           mkdir -p package/usr/share/icons/hicolor/128x128/apps
           mkdir -p package/usr/share/icons/hicolor/256x256/apps
           mkdir -p package/usr/share/icons/hicolor/512x515/apps
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} package/usr/bin/
           cp resources/linux/navop.desktop package/usr/share/applications/
           cp resources/linux/navop.xml package/usr/share/mime/packages/
           cp resources/linux/navop-128.png package/usr/share/icons/hicolor/128x128/apps/navop.png
           cp resources/linux/navop-256.png package/usr/share/icons/hicolor/256x256/apps/navop.png
           cp resources/linux/navop-512.png package/usr/share/icons/hicolor/512x515/apps/navop.png
-          tar czf ${{ matrix.archive }} -C package .
+          tar \
+            --sort=name \
+            --mtime='UTC 1970-01-01' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -czf "${{ matrix.archive }}" \
+            -C package .
 
       - name: Install Linux packaging dependencies
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && !matrix.portable_linux
         run: |
           sudo apt-get update
           sudo apt-get install -y rpm
 
       - name: Package Linux installers (x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && !matrix.portable_linux
         shell: bash
         run: |
           set -euo pipefail
@@ -523,7 +619,7 @@ jobs:
           path: ${{ matrix.windows_basename }}.exe
 
       - name: Upload Linux installer artifacts
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && !matrix.portable_linux
         uses: actions/upload-artifact@v4
         with:
           name: navop-linux-x86_64-installers

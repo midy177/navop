@@ -11,6 +11,7 @@ use crate::database_toolbar::{
 use crate::database_users_tab::DatabaseUsersTab;
 use crate::db_tree_event::DatabaseEventHandler;
 use crate::db_tree_view::{DbTreeView, DbTreeViewEvent, SqlDumpMode};
+use crate::sidebar::execution_history_panel::ExecutionHistoryPanel;
 use crate::sidebar::{DatabaseSidebar, DatabaseSidebarEvent};
 use crate::sql_editor_view::SqlEditorTab;
 use ai_chat_view::{CodeBlockAction, LanguageMatcher};
@@ -19,9 +20,9 @@ use db::{
     ipc::{IpcDriverRegistry, driver_icon_from_asset_path, driver_icon_from_file_path},
 };
 use gpui::{
-    AnyElement, App, AppContext, AsyncApp, Axis, Bounds, Context, Element, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, SharedString,
+    AnyElement, App, AppContext, AsyncApp, Axis, Bounds, ColorExt, Context, Element, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement as _, Style, Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::WindowExt;
@@ -188,22 +189,45 @@ impl DatabaseTabView {
 
         let status_msg = cx.new(|_| "Ready".to_string());
         let is_connected = cx.new(|_| true);
+        let connection_ids = connections
+            .iter()
+            .filter_map(|connection| connection.id.map(|id| id.to_string()))
+            .collect::<Vec<_>>();
+        let execution_history = cx.new({
+            let connection_ids = connection_ids.clone();
+            move |cx| ExecutionHistoryPanel::new(connection_ids, cx)
+        });
 
         let event_handler = cx.new(|cx| {
             DatabaseEventHandler::new(
                 &db_tree_view,
                 tab_container.clone(),
                 objects_panel.clone(),
+                connection_ids.clone(),
+                execution_history.clone(),
                 window,
                 cx,
             )
         });
 
-        let sidebar =
-            cx.new(|cx| DatabaseSidebar::new(connections.clone(), active_conn_id, window, cx));
+        let sidebar = cx.new(|cx| {
+            DatabaseSidebar::new(
+                connections.clone(),
+                active_conn_id,
+                execution_history.clone(),
+                window,
+                cx,
+            )
+        });
 
         // 注册 SQL 代码块操作
-        Self::register_sql_code_block_actions(&sidebar, tab_container.clone(), &connections, cx);
+        Self::register_sql_code_block_actions(
+            &sidebar,
+            tab_container.clone(),
+            &connections,
+            execution_history,
+            cx,
+        );
 
         let mut subscriptions = Vec::new();
         subscriptions.push(
@@ -300,10 +324,15 @@ impl DatabaseTabView {
         sidebar: &Entity<DatabaseSidebar>,
         tab_container: Entity<TabContainer>,
         connections: &[StoredConnection],
+        execution_history: Entity<ExecutionHistoryPanel>,
         cx: &mut App,
     ) {
         // 获取第一个连接的信息用于创建新编辑器
         let first_conn = connections.first().cloned();
+        let available_connection_ids = connections
+            .iter()
+            .filter_map(|connection| connection.id.map(|id| id.to_string()))
+            .collect::<Vec<_>>();
 
         // 操作1：插入到当前编辑器
         let tab_container_for_insert = tab_container.clone();
@@ -335,6 +364,7 @@ impl DatabaseTabView {
 
         // 操作2：打开新编辑器
         let tab_container_for_new = tab_container.clone();
+        let execution_history_for_new = execution_history;
         if let Some(new_editor_action) = CodeBlockAction::new("sql-open-new-editor")
             .icon(IconName::Query)
             .label(t!("DatabaseTab.open_new_editor").to_string())
@@ -353,6 +383,8 @@ impl DatabaseTabView {
                 let tab_id_clone = tab_id.clone();
                 let conn_id_clone = connection_id.clone();
                 let code_clone = code.clone();
+                let available_connection_ids = available_connection_ids.clone();
+                let execution_history = execution_history_for_new.clone();
 
                 tab_container_for_new.update(cx, |container, cx| {
                     container.activate_or_add_tab_lazy(
@@ -363,11 +395,13 @@ impl DatabaseTabView {
                                     crate::sql_editor_view::SqlEditorTabConfig {
                                         title: "AI Query".into(),
                                         connection_id: connection_id.clone(),
+                                        available_connection_ids: available_connection_ids.clone(),
                                         database_type,
                                         file_path: None,
                                         new_file_directory: None,
                                         initial_database: None,
                                         initial_schema: None,
+                                        execution_history,
                                     },
                                     window,
                                     cx,
@@ -743,7 +777,7 @@ impl DatabaseTabView {
                                     .child("⟳")
                             })
                             .when(is_error, |this| {
-                                this.bg(Hsla::red())
+                                this.bg(gpui::red())
                                     .text_color(gpui::white())
                                     .text_2xl()
                                     .child("✕")
@@ -809,7 +843,7 @@ impl DatabaseTabView {
                 div()
                     .text_lg()
                     .when(!is_error, |this| this.text_color(cx.theme().accent))
-                    .when(is_error, |this| this.text_color(Hsla::red()))
+                    .when(is_error, |this| this.text_color(gpui::red()))
                     .child(status_text),
             )
             .into_any_element()
@@ -986,6 +1020,7 @@ mod tests {
             port: 0,
             username: String::new(),
             password: String::new(),
+            credential_reference: None,
             database: None,
             service_name: None,
             sid: None,

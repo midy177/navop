@@ -5,12 +5,12 @@
 use std::time::{Duration, Instant};
 
 use gpui::*;
-use gpui_component::ElementExt as _;
+use gpui_component::{ElementExt as _, menu::ContextMenuExt};
+use rust_i18n::t;
 
-use super::Editor;
+use super::{Editor, MountedRun};
 use crate::components::Block;
 use crate::components::CalloutVariant;
-use crate::i18n::I18nManager;
 use crate::theme::{Theme, ThemeDimensions};
 
 /// Rows within this many pixels of the viewport stay mounted, so a fast flick
@@ -288,14 +288,13 @@ impl Editor {
             return;
         };
 
-        let strings = cx.global::<I18nManager>().strings_arc();
-        let buttons = [
-            strings.open_link_open.as_str(),
-            strings.open_link_cancel.as_str(),
-        ];
+        let open = t!("MarkdownEditor.open_link_open").to_string();
+        let cancel = t!("MarkdownEditor.open_link_cancel").to_string();
+        let title = t!("MarkdownEditor.open_link_title").to_string();
+        let buttons = [open.as_str(), cancel.as_str()];
         let prompt = window.prompt(
             PromptLevel::Info,
-            &strings.open_link_title,
+            &title,
             Some(&link.prompt_target),
             &buttons,
             cx,
@@ -348,6 +347,7 @@ impl Render for Editor {
         let theme = self.effective_theme(cx);
         let d = &theme.dimensions;
         let visible_blocks = self.document.visible_blocks().to_vec();
+        let editor_entity = cx.entity();
         let editor = cx.entity().downgrade();
         let scroll_trigger_padding = (d.block_min_height * 0.75).max(16.0);
         let max_scroll_y = f32::from(self.scroll_handle.max_offset().y.max(px(0.0)));
@@ -419,19 +419,13 @@ impl Render for Editor {
                                 .flex_shrink_0()
                                 .mt(px(footnote_row_top_gap(previous_footnote_row, d.block_gap)))
                                 .child(entity.clone());
-                            let row = if self.view_mode == super::ViewMode::Rendered {
-                                let row_editor = editor.clone();
-                                let entity_id = entity.entity_id();
-                                row.on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                                    let _ = row_editor.update(cx, |editor, cx| {
-                                        editor.on_block_context_menu_mouse_down(
-                                            entity_id, event, window, cx,
-                                        );
-                                    });
-                                })
-                            } else {
-                                row
-                            };
+                            let row_editor = editor_entity.clone();
+                            let entity_id = entity.entity_id();
+                            let row = row.on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                                row_editor.update(cx, |editor, cx| {
+                                    editor.set_block_context_menu_target(entity_id, cx);
+                                });
+                            });
                             footnote_children.push(row.into_any_element());
                             previous_footnote_row = Some(footnote_spacing);
                             footnote_end += 1;
@@ -464,18 +458,13 @@ impl Render for Editor {
                             d,
                         )))
                         .child(entity.clone());
-                    let row = if self.view_mode == super::ViewMode::Rendered {
-                        let row_editor = editor.clone();
-                        let entity_id = entity.entity_id();
-                        row.on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                            let _ = row_editor.update(cx, |editor, cx| {
-                                editor
-                                    .on_block_context_menu_mouse_down(entity_id, event, window, cx);
-                            });
-                        })
-                    } else {
-                        row
-                    };
+                    let row_editor = editor_entity.clone();
+                    let entity_id = entity.entity_id();
+                    let row = row.on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                        row_editor.update(cx, |editor, cx| {
+                            editor.set_block_context_menu_target(entity_id, cx);
+                        });
+                    });
                     group_children.push(row.into_any_element());
                     previous_callout_row = Some(row_spacing);
                     group_end += 1;
@@ -521,18 +510,13 @@ impl Render for Editor {
                         .flex_shrink_0()
                         .mt(px(footnote_row_top_gap(previous_footnote_row, d.block_gap)))
                         .child(entity.clone());
-                    let row = if self.view_mode == super::ViewMode::Rendered {
-                        let row_editor = editor.clone();
-                        let entity_id = entity.entity_id();
-                        row.on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                            let _ = row_editor.update(cx, |editor, cx| {
-                                editor
-                                    .on_block_context_menu_mouse_down(entity_id, event, window, cx);
-                            });
-                        })
-                    } else {
-                        row
-                    };
+                    let row_editor = editor_entity.clone();
+                    let entity_id = entity.entity_id();
+                    let row = row.on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                        row_editor.update(cx, |editor, cx| {
+                            editor.set_block_context_menu_target(entity_id, cx);
+                        });
+                    });
                     group_children.push(row.into_any_element());
                     previous_footnote_row = Some(row_spacing);
                     group_end += 1;
@@ -561,17 +545,13 @@ impl Render for Editor {
                 .flex_shrink_0()
                 .mt(px(top_gap))
                 .child(entity.clone());
-            let row = if self.view_mode == super::ViewMode::Rendered {
-                let row_editor = editor.clone();
-                let entity_id = entity.entity_id();
-                row.on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                    let _ = row_editor.update(cx, |editor, cx| {
-                        editor.on_block_context_menu_mouse_down(entity_id, event, window, cx);
-                    });
-                })
-            } else {
-                row
-            };
+            let row_editor = editor_entity.clone();
+            let entity_id = entity.entity_id();
+            let row = row.on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                row_editor.update(cx, |editor, cx| {
+                    editor.set_block_context_menu_target(entity_id, cx);
+                });
+            });
             row_starts.push(index);
             row_top_gaps.push(top_gap);
             row_elements.push(row.into_any_element());
@@ -597,20 +577,10 @@ impl Render for Editor {
                     .saturating_sub(1)
             });
 
-        // A row's first block keys its cached height; its painted top (from last
-        // frame) feeds the footprints below.
+        // A row's first block keys its cached footprint.
         let row_first_ids: Vec<EntityId> = row_starts
             .iter()
             .map(|&start| visible_blocks[start].entity.entity_id())
-            .collect();
-        let row_tops: Vec<Option<f32>> = row_starts
-            .iter()
-            .map(|&start| {
-                visible_blocks[start]
-                    .entity
-                    .read_with(cx, |block, _cx| block.last_bounds)
-                    .map(|bounds| f32::from(bounds.top()))
-            })
             .collect();
 
         // On a structural edit the row indices no longer match last frame, so the
@@ -637,15 +607,33 @@ impl Render for Editor {
             .map(|id| self.row_stride_cache.get(id).copied().unwrap_or(estimate))
             .collect();
 
-        // Rows mounted together last frame shared one scroll offset, so their
-        // adjacent painted-top differences are scroll-free heights. Caching those,
-        // not raw positions, is what keeps the window stable while scrolling.
-        if !structural_change {
-            if let Some((prev_start, prev_end)) = self.prev_render_window {
-                let prev_end = prev_end.min(row_first_ids.len());
-                for row in prev_start..prev_end.saturating_sub(1) {
-                    if let (Some(top), Some(next_top)) = (row_tops[row], row_tops[row + 1]) {
-                        let stride = next_top - top;
+        // A footprint only holds for the column it was measured at. The first
+        // frame has no scroll bounds yet, so the column collapses to its 1px
+        // floor and every block wraps a character per line; keeping those
+        // measurements would leave the document permanently mis-sized.
+        let width_changed = self.row_stride_width != Some(centered_width);
+        if width_changed {
+            self.row_stride_cache.clear();
+            self.row_stride_width = Some(centered_width);
+        }
+
+        // The scroll container records every mounted child's layout bounds, so
+        // adjacent tops differ by exactly one row's footprint whatever the row
+        // holds. Caching those differences, not raw positions, keeps the window
+        // stable while scrolling.
+        if !structural_change && !width_changed {
+            if let Some(prev) = self
+                .prev_mounted_run
+                .filter(|prev| self.mounted_run_is_addressable(*prev))
+            {
+                let prev_end = prev.row_end.min(row_first_ids.len());
+                for row in prev.row_start..prev_end.saturating_sub(1) {
+                    let child = prev.child_base + row - prev.row_start;
+                    if let (Some(bounds), Some(next_bounds)) = (
+                        self.scroll_handle.bounds_for_item(child),
+                        self.scroll_handle.bounds_for_item(child + 1),
+                    ) {
+                        let stride = f32::from(next_bounds.top() - bounds.top());
                         if stride > 0.0 && stride.is_finite() {
                             self.row_stride_cache.insert(row_first_ids[row], stride);
                         }
@@ -685,39 +673,63 @@ impl Render for Editor {
             RENDER_OVERDRAW_PX,
             focus_row,
         );
-        self.prev_render_window = Some((render_window.run_start, render_window.run_end));
-
-        // The first mounted row re-applies its `mt`, so drop it from the top
-        // spacer to avoid shifting content down by a gap.
-        let top_h = match row_top_gaps.get(render_window.run_start) {
-            Some(gap) => (render_window.top_h - gap).max(0.0),
-            None => render_window.top_h,
+        let island = render_window.focus_island;
+        let island_before_run = island.is_some_and(|island| island.row < render_window.run_start);
+        // A mounted row re-applies its own `mt`, which the preceding stride
+        // already covered, so every spacer sheds the gap of the row it precedes.
+        let spacer_before = |row: usize, height: f32| -> f32 {
+            match row_top_gaps.get(row) {
+                Some(gap) => (height - gap).max(0.0),
+                None => height,
+            }
         };
         let mut block_rows: Vec<AnyElement> =
-            Vec::with_capacity(render_window.run_end - render_window.run_start + 2);
-        if top_h > 0.5 {
-            block_rows.push(
-                div()
-                    .w_full()
-                    .flex_shrink_0()
-                    .h(px(top_h))
-                    .into_any_element(),
-            );
-        }
-        for (row_index, element) in row_elements.into_iter().enumerate() {
-            if row_index >= render_window.run_start && row_index < render_window.run_end {
-                block_rows.push(element);
+            Vec::with_capacity(render_window.run_end - render_window.run_start + 4);
+        let push_spacer = |rows: &mut Vec<AnyElement>, height: f32| {
+            if height > 0.5 {
+                rows.push(
+                    div()
+                        .w_full()
+                        .flex_shrink_0()
+                        .h(px(height))
+                        .into_any_element(),
+                );
             }
+        };
+
+        let mut row_elements: Vec<Option<AnyElement>> =
+            row_elements.into_iter().map(Some).collect();
+        let mut take_row = |rows: &mut Vec<AnyElement>, row: usize| {
+            if let Some(element) = row_elements.get_mut(row).and_then(Option::take) {
+                rows.push(element);
+            }
+        };
+
+        if let Some(island) = island.filter(|_| island_before_run) {
+            push_spacer(&mut block_rows, spacer_before(island.row, island.lead_h));
+            take_row(&mut block_rows, island.row);
         }
-        if render_window.bottom_h > 0.5 {
-            block_rows.push(
-                div()
-                    .w_full()
-                    .flex_shrink_0()
-                    .h(px(render_window.bottom_h))
-                    .into_any_element(),
-            );
+        push_spacer(
+            &mut block_rows,
+            spacer_before(render_window.run_start, render_window.top_h),
+        );
+        let run_child_base = block_rows.len();
+        for row in render_window.run_start..render_window.run_end {
+            take_row(&mut block_rows, row);
         }
+        if let Some(island) = island.filter(|_| !island_before_run) {
+            push_spacer(&mut block_rows, spacer_before(island.row, island.lead_h));
+            take_row(&mut block_rows, island.row);
+        }
+        push_spacer(&mut block_rows, render_window.bottom_h);
+        // Next frame reads the run's footprints back at these child indices, and
+        // re-checks `child_count` before trusting them.
+        self.prev_mounted_run = Some(MountedRun {
+            row_start: render_window.run_start,
+            row_end: render_window.run_end,
+            child_base: run_child_base,
+            child_count: block_rows.len(),
+        });
 
         let scroll_content = div()
             .id("editor-scroll-inner")
@@ -743,14 +755,27 @@ impl Render for Editor {
                 + scroll_trigger_padding
                 + scroll_beyond_bottom))
             .children(block_rows);
-        let scroll_content = if self.view_mode == super::ViewMode::Rendered {
-            scroll_content.on_mouse_down(
-                MouseButton::Right,
-                cx.listener(Self::on_editor_context_menu_mouse_down),
-            )
-        } else {
-            scroll_content
-        };
+        let scroll_editor = editor_entity.clone();
+        let scroll_content = scroll_content
+            .context_menu(move |menu, window, cx| {
+                let target = scroll_editor.read(cx).context_menu_target_for_popup();
+                Editor::build_popup_context_menu(
+                    scroll_editor.clone(),
+                    target.block_target,
+                    target.insert_target.or_else(|| {
+                        (target.block_target.is_none()
+                            && scroll_editor.read(cx).view_mode == super::ViewMode::Rendered)
+                            .then_some(super::context_menu::TableInsertTarget::Append)
+                    }),
+                    target.table_target,
+                    menu,
+                    window,
+                    cx,
+                )
+            })
+            // Table commands depend on the active cell's edit state. The menu
+            // remains mouse-interactive without taking focus from that cell.
+            .preserve_focus();
 
         let content_area = div()
             .id("editor-scroll")
@@ -866,7 +891,6 @@ impl Render for Editor {
             .capture_action(cx.listener(Self::on_cut_capture))
             .capture_action(cx.listener(Self::on_delete_capture))
             .capture_action(cx.listener(Self::on_delete_back_capture))
-            .capture_key_down(cx.listener(Self::on_editor_key_down_capture))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_toggle_view_mode_action))
@@ -876,15 +900,13 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_jump_to_bottom))
             .on_action(cx.listener(Self::on_dismiss_transient_ui));
         let base = base.child(content_area);
-        let base = if let Some(context_menu) = self.render_context_menu_overlay(&theme, cx) {
-            base.child(context_menu)
-        } else {
-            base
-        };
+        let mut base = base;
         if let Some(table_dialog) = self.render_table_insert_dialog_overlay(&theme, cx) {
-            base.child(table_dialog)
-        } else {
-            base
+            base = base.child(table_dialog);
         }
+        if let Some(enlarged) = self.render_enlarged_block_overlay(&theme, window, cx) {
+            base = base.child(enlarged);
+        }
+        base
     }
 }

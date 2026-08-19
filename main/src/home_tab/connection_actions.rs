@@ -52,6 +52,10 @@ impl HomePage {
                 self.editing_connection_id = Some(connection_id);
                 self.show_serial_form(window, cx);
             }
+            ConnectionType::Telnet => {
+                self.editing_connection_id = Some(connection_id);
+                self.show_telnet_form(window, cx);
+            }
             ConnectionType::PortForwarding => {
                 self.editing_connection_id = Some(connection_id);
                 self.show_port_forwarding_form(window, cx);
@@ -409,6 +413,12 @@ mod sensitive_copy_tests {
                 auth_method: SshAuthMethod::Password {
                     password: "clipboard-secret".to_string(),
                 },
+                credential_reference: None,
+                prompt_username: None,
+                prompt_password: None,
+                keyboard_interactive: None,
+                terminal_encoding: Default::default(),
+                terminal_type: Default::default(),
                 connect_timeout: None,
                 keepalive_interval: None,
                 keepalive_max: None,
@@ -421,6 +431,7 @@ mod sensitive_copy_tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         )

@@ -12,6 +12,7 @@ pub(super) enum ConnectionCopyAction {
     RedisAddress,
     MongoDbAddress,
     RemoteDesktopAddress,
+    TelnetAddress,
     Username,
     SerialPort,
     ForwardingRule,
@@ -130,6 +131,11 @@ pub(super) fn connection_copy_actions(
                 ]);
             }
         }
+        ConnectionType::Telnet => {
+            if connection_address(connection).is_some() {
+                actions.push(ConnectionCopyAction::TelnetAddress);
+            }
+        }
         ConnectionType::PortForwarding => {
             if forwarding_rule(connection).is_some() {
                 actions.push(ConnectionCopyAction::ForwardingRule);
@@ -172,6 +178,7 @@ pub(super) fn connection_copy_text(
         ConnectionCopyAction::RedisAddress => connection_address(connection),
         ConnectionCopyAction::MongoDbAddress => connection_address(connection),
         ConnectionCopyAction::RemoteDesktopAddress => connection_address(connection),
+        ConnectionCopyAction::TelnetAddress => connection_address(connection),
         ConnectionCopyAction::Username => connection_username(connection),
         ConnectionCopyAction::SerialPort => serial_port(connection),
         ConnectionCopyAction::ForwardingRule => forwarding_rule(connection),
@@ -279,6 +286,10 @@ fn connection_address(connection: &StoredConnection) -> Option<String> {
                     })
             }),
         ConnectionType::Serial | ConnectionType::PortForwarding => None,
+        ConnectionType::Telnet => connection
+            .to_telnet_params()
+            .ok()
+            .and_then(|params| optional_host_port(&params.host, Some(params.port))),
         ConnectionType::Rdp | ConnectionType::Vnc => connection
             .to_remote_desktop_params()
             .ok()
@@ -396,6 +407,12 @@ mod tests {
                 auth_method: SshAuthMethod::Password {
                     password: "secret".to_string(),
                 },
+                credential_reference: None,
+                prompt_username: None,
+                prompt_password: None,
+                keyboard_interactive: None,
+                terminal_encoding: Default::default(),
+                terminal_type: Default::default(),
                 connect_timeout: None,
                 keepalive_interval: None,
                 keepalive_max: None,
@@ -408,6 +425,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         )
@@ -424,6 +442,7 @@ mod tests {
                 port: 5432,
                 username: "db-user".to_string(),
                 password: "db-secret".to_string(),
+                credential_reference: None,
                 database: Some("app".to_string()),
                 service_name: None,
                 sid: None,
@@ -440,6 +459,7 @@ mod tests {
             master_name: "mymaster".to_string(),
             sentinels: vec!["redis-1:26379".to_string()],
             sentinel_password: Some("sentinel-secret".to_string()),
+            credential_reference: None,
         });
         let cluster = (mode == RedisMode::Cluster).then(|| RedisClusterConfig {
             nodes: vec!["redis-1:6379".to_string(), "redis-2:6379".to_string()],
@@ -451,6 +471,7 @@ mod tests {
                 port: 6379,
                 password: Some("redis-secret".to_string()),
                 username: Some("redis-user".to_string()),
+                credential_reference: None,
                 db_index: 2,
                 mode,
                 use_tls: false,
@@ -539,6 +560,7 @@ mod tests {
                 database: Some("app".to_string()),
                 username: Some("admin".to_string()),
                 password: Some("secret".to_string()),
+                credential_reference: None,
                 auth_source: Some("admin".to_string()),
                 replica_set: None,
                 read_preference: None,
@@ -703,10 +725,13 @@ mod tests {
                 port: 3389,
                 username: Some("desktop-user".to_string()),
                 password: Some("desktop-secret".to_string()),
+                credential_reference: None,
                 domain: None,
                 read_only: false,
                 audio_playback: false,
                 proxy: None,
+                backend_preference: Default::default(),
+                rdp: None,
             },
             None,
         );
@@ -770,10 +795,13 @@ mod tests {
                 port: 3389,
                 username: Some("desktop-user".to_string()),
                 password: Some("desktop-secret".to_string()),
+                credential_reference: None,
                 domain: None,
                 read_only: false,
                 audio_playback: false,
                 proxy: None,
+                backend_preference: Default::default(),
+                rdp: None,
             },
             None,
         );

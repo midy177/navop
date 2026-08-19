@@ -1,6 +1,6 @@
 [package]
 name = "main"
-version = "0.10.3"
+version = "0.10.7"
 publish.workspace = true
 edition.workspace = true
 
@@ -14,6 +14,7 @@ gpui_platform = { workspace = true }
 gpui-component = { workspace = true, features = ["tree-sitter-bash", "tree-sitter-sql"] }
 gpui-component-assets = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 semver = { workspace = true }
@@ -24,6 +25,7 @@ tracing-appender = "0.2"
 dotenvy = "0.15"
 rust-i18n = { workspace = true }
 base64 = { workspace = true }
+regex = { workspace = true }
 percent-encoding = { workspace = true }
 url = { workspace = true }
 dirs = {workspace = true}
@@ -34,10 +36,12 @@ extension-runtime = { workspace = true, features = ["wasm-components"] }
 extension-host.workspace = true
 extension_view = { workspace = true }
 notes = { workspace = true }
+json_view = { workspace = true }
+api_tools = { workspace = true, optional = true }
 terminal = { workspace = true }
 terminal_view = { workspace = true }
 agent_runtime = { workspace = true }
-ai_chat_view = { workspace = true }
+ai_chat_view = { workspace = true, default-features = false }
 public_mcp = { workspace = true }
 tool_runtime = { workspace = true }
 port_forwarding = { workspace = true }
@@ -77,16 +81,19 @@ gpui = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 
 [features]
-default = ["wasm-components"]
+default = ["wasm-components", "embedded-webview"]
+api-testing = ["dep:api_tools"]
 builtin-duckdb = ["db/builtin-duckdb", "db_view/builtin-duckdb", "onetcli_runtime/builtin-duckdb"]
 builtin-redis = ["redis_view/builtin-redis", "onetcli_runtime/builtin-redis"]
 builtin-mongodb = ["mongodb_view/builtin-mongodb"]
 builtin-data-drivers = ["builtin-redis", "builtin-mongodb"]
+embedded-webview = ["ai_chat_view/embedded-webview"]
 github-distribution = ["github-updates", "github-marketplace"]
 github-marketplace = ["extension-runtime/github-marketplace"]
 github-updates = []
 screenshot-safe = []
 wasm-components = ["extension-runtime/wasm-components"]
+windows-native-rdp = ["remote_desktop_view/windows-native-rdp"]
 
 [lints]
 workspace = true

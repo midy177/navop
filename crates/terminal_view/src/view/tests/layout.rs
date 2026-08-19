@@ -32,19 +32,28 @@ fn disconnected_terminal_uses_a_non_blocking_status_banner() {
             &ConnectionState::Disconnected { error: None },
             false,
             false,
+            false,
         )
     );
     assert_eq!(
         Some(ConnectionStatusPresentation::Banner),
-        connection_status_presentation(&ConnectionState::Connecting, false, false)
+        connection_status_presentation(&ConnectionState::Connecting, false, false, false)
     );
 }
 
 #[test]
-fn ssh_mfa_keeps_the_blocking_connection_dialog() {
+fn terminal_credentials_and_ssh_mfa_keep_the_blocking_connection_dialog() {
     assert_eq!(
         Some(ConnectionStatusPresentation::Dialog),
-        connection_status_presentation(&ConnectionState::Connecting, false, true)
+        connection_status_presentation(&ConnectionState::Connecting, false, true, false)
+    );
+    assert_eq!(
+        Some(ConnectionStatusPresentation::Dialog),
+        connection_status_presentation(&ConnectionState::Connecting, false, false, true)
+    );
+    assert_eq!(
+        Some(ConnectionStatusPresentation::Dialog),
+        connection_status_presentation(&ConnectionState::Connecting, false, true, true)
     );
 }
 
@@ -52,11 +61,16 @@ fn ssh_mfa_keeps_the_blocking_connection_dialog() {
 fn host_key_confirmation_and_connected_state_hide_connection_status() {
     assert_eq!(
         None,
-        connection_status_presentation(&ConnectionState::Disconnected { error: None }, true, false,)
+        connection_status_presentation(
+            &ConnectionState::Disconnected { error: None },
+            true,
+            true,
+            true,
+        )
     );
     assert_eq!(
         None,
-        connection_status_presentation(&ConnectionState::Connected, false, false)
+        connection_status_presentation(&ConnectionState::Connected, false, true, true)
     );
 }
 
@@ -70,6 +84,42 @@ fn connection_status_rendering_does_not_restore_the_full_screen_backdrop() {
         !source.contains(".bg(Hsla {"),
         "ordinary reconnect feedback must not cover the terminal with a dark backdrop"
     );
+}
+
+#[test]
+fn connection_error_banner_shows_scrollable_multiline_details() {
+    let source = include_str!("../connection_overlay.rs");
+    let error_block = source
+        .split(".when_some(error_msg")
+        .nth(1)
+        .expect("connection overlay should render an error block");
+
+    assert!(
+        error_block.contains(".whitespace_normal()"),
+        "terminal connection error details should wrap instead of staying on one line"
+    );
+    assert!(
+        error_block.contains(".overflow_scrollbar()"),
+        "long terminal connection error details, including unbroken tokens, should remain inspectable"
+    );
+    assert!(
+        error_block.contains(".max_h(px("),
+        "the scrollable terminal connection error area should have a bounded height"
+    );
+    assert!(
+        !error_block.contains(".truncate()"),
+        "terminal connection error details must not be visually truncated"
+    );
+}
+
+#[test]
+fn credential_dialog_supports_ssh_and_telnet_runtime_prompts() {
+    let source = include_str!("../connection_overlay.rs");
+
+    assert!(source.contains("SshSession.credentials_required"));
+    assert!(source.contains("TelnetSession.credentials_required"));
+    assert!(source.contains("submit-terminal-credentials"));
+    assert!(source.contains("submit_credentials"));
 }
 
 #[test]
@@ -184,6 +234,26 @@ fn terminal_context_menu_exposes_clear_screen() {
 
     assert!(source.contains("ContextMenu.clear_screen_with_shortcut"));
     assert!(source.contains("this.clear_screen(&ClearScreen, window, cx)"));
+}
+
+#[test]
+fn terminal_context_menu_pastes_selected_text_through_safe_paste_path() {
+    let source = include_str!("../terminal_render.rs");
+    let context_menu = source
+        .split("pub(super) fn build_context_menu")
+        .nth(1)
+        .expect("terminal context menu should exist");
+    let paste_selection = context_menu
+        .split("ContextMenu.paste_selection")
+        .nth(1)
+        .expect("paste-selection item should exist");
+    let regular_paste = paste_selection
+        .find("ContextMenu.paste_with_shortcut")
+        .expect("paste-selection should be placed before clipboard paste");
+    let paste_selection = &paste_selection[..regular_paste];
+
+    assert!(paste_selection.contains(".disabled(!can_paste_selection)"));
+    assert!(paste_selection.contains("this.paste_text(&selection_text, window, cx)"));
 }
 
 #[test]
@@ -435,15 +505,15 @@ fn command_bar_reflows_the_canvas_and_preserves_bounds_driven_pty_resize() {
     assert!(viewport.contains(".flex_1()"));
     assert!(viewport.contains(".min_h_0()"));
 
-    let canvas = render_surface_source
-        .split("fn render_input_canvas")
+    let surface = render_surface_source
+        .split("fn render_terminal_surface")
         .nth(1)
-        .and_then(|source| source.split("fn render_terminal_surface").next())
-        .expect("terminal input canvas implementation should exist");
-    assert!(canvas.contains("this.resize_if_needed(bounds, cx);"));
+        .and_then(|source| source.split("fn render_addon_tooltip").next())
+        .expect("terminal surface implementation should exist");
+    assert!(surface.contains("window.content_mask().bounds"));
+    assert!(surface.contains("this.resize_if_needed(viewport_bounds, cx);"));
 
-    assert!(terminal_layout_source.contains("bounds.size.width / self.cell_width"));
-    assert!(terminal_layout_source.contains("bounds.size.height / self.line_height"));
+    assert!(terminal_layout_source.contains("terminal_grid_size("));
     assert!(terminal_layout_source.contains("terminal.resize("));
     assert!(
         !render_layout_source.contains("COMMAND_BAR_COLLAPSED_HEIGHT"),
@@ -453,6 +523,47 @@ fn command_bar_reflows_the_canvas_and_preserves_bounds_driven_pty_resize() {
         !command_bar_source.contains("resize_if_needed"),
         "the command bar must let the canvas bounds drive the existing resize path"
     );
+}
+
+#[test]
+fn clipped_terminal_surface_uses_the_visible_width_for_grid_columns() {
+    let surface_bounds = Bounds::new(Point::new(px(12.0), px(12.0)), size(px(1000.0), px(420.0)));
+    let content_mask_bounds =
+        Bounds::new(Point::new(px(12.0), px(12.0)), size(px(800.0), px(380.0)));
+
+    let viewport_bounds = terminal_viewport_bounds(surface_bounds, content_mask_bounds);
+
+    assert_eq!(
+        viewport_bounds,
+        Bounds::new(Point::new(px(12.0), px(12.0)), size(px(800.0), px(380.0)))
+    );
+    assert_eq!(
+        terminal_grid_size(viewport_bounds.size, px(10.0), px(20.0)),
+        (80, 19)
+    );
+    assert_eq!(
+        terminal_grid_size(surface_bounds.size, px(10.0), px(20.0)),
+        (100, 21),
+        "the unclipped surface would tell the PTY to wrap twenty columns too late"
+    );
+}
+
+#[test]
+fn terminal_viewport_bounds_preserves_the_grid_origin_when_clipped() {
+    let surface_bounds = Bounds::new(Point::new(px(100.0), px(80.0)), size(px(500.0), px(300.0)));
+    let offset_mask = Bounds::new(Point::new(px(140.0), px(120.0)), size(px(300.0), px(180.0)));
+    let disjoint_mask = Bounds::new(Point::new(px(700.0), px(500.0)), size(px(100.0), px(100.0)));
+
+    assert_eq!(
+        terminal_viewport_bounds(surface_bounds, offset_mask),
+        Bounds::new(Point::new(px(100.0), px(80.0)), size(px(340.0), px(220.0))),
+        "clipping must not shift the terminal grid origin used by mouse and IME coordinates"
+    );
+
+    let empty = terminal_viewport_bounds(surface_bounds, disjoint_mask);
+    assert_eq!(empty.origin, surface_bounds.origin);
+    assert_eq!(empty.size, size(px(0.0), px(0.0)));
+    assert_eq!(terminal_grid_size(empty.size, px(10.0), px(20.0)), (1, 1));
 }
 
 #[test]

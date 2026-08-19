@@ -54,6 +54,10 @@ pub(crate) fn right_tool_region_width(
     }
 }
 
+pub(crate) fn right_sidebar_width(outer_right: Pixels, mouse_x: Pixels) -> Pixels {
+    outer_right - TOOLBAR_WIDTH - mouse_x
+}
+
 pub(crate) fn render_internal_tool_panel_frame(
     sidebar: Entity<TerminalSidebar>,
     panel: SidebarPanel,
@@ -292,6 +296,11 @@ mod tests {
     }
 
     #[test]
+    fn right_sidebar_resize_excludes_toolbar_width() {
+        assert_eq!(px(256.0), right_sidebar_width(px(1000.0), px(700.0)));
+    }
+
+    #[test]
     fn layout_preserves_all_three_edges() {
         let layout = TerminalToolDockLayout::from_open_panels([
             (SidebarPanel::Settings, SidebarPlacement::Left),
@@ -323,7 +332,7 @@ mod tests {
 
     #[test]
     fn internal_tool_panel_title_claims_remaining_header_width() {
-        let source = include_str!("tool_dock.rs");
+        let source = include_str!("tool_dock.rs").replace("\r\n", "\n");
         let header_start = source
             .find("fn render_internal_tool_panel_header")
             .expect("internal tool panel header renderer");

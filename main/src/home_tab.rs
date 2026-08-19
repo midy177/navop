@@ -43,10 +43,10 @@ use one_core::popup_window::{PopupWindowOptions, open_popup_window};
 use one_core::settings::{AppSettings, HomeConnectionLayout, HomePageStyle, SyncProvider};
 use one_core::storage::traits::Repository;
 use one_core::storage::{
-    ActiveConnections, ConnectionRepository, ConnectionType, DatabaseType, GlobalStorageState,
-    PendingCloudDeletionRepository, RedisMode, RemoteDesktopParams,
-    RemoteDesktopProtocol as StoredRemoteDesktopProtocol, StoredConnection, TeamMembershipState,
-    Workspace, WorkspaceRepository,
+    ActiveConnections, ConnectionRepository, ConnectionType, CredentialResolutionError,
+    DatabaseType, GlobalStorageState, PendingCloudDeletionRepository, RedisMode,
+    RemoteDesktopParams, RemoteDesktopProtocol as StoredRemoteDesktopProtocol, SshAuthMethod,
+    StoredConnection, TeamMembershipState, TelnetLoginStep, Workspace, WorkspaceRepository,
 };
 use one_core::tab_container::{TabContainer, TabContent, TabContentEvent, TabItem, TabOpenMode};
 use port_forwarding::PortForwardingRuntime;
@@ -58,6 +58,7 @@ use redis_view::{RedisFormWindow, RedisFormWindowConfig};
 use rust_i18n::t;
 use terminal_view::{SerialFormWindow, SerialFormWindowConfig};
 use terminal_view::{SshFormWindow, SshFormWindowConfig};
+use terminal_view::{TelnetFormWindow, TelnetFormWindowConfig};
 
 use crate::auth::{AuthService, load_auth_data, show_auth_dialog};
 use crate::connection_visuals::{
@@ -90,11 +91,11 @@ actions!(
     ]
 );
 
-const HOME_SIDEBAR_EXPANDED_WIDTH: gpui::Pixels = px(220.0);
-const HOME_SIDEBAR_COLLAPSED_WIDTH: gpui::Pixels = px(68.0);
 const MODERN_HOME_CARD_MIN_WIDTH: gpui::Pixels = px(220.0);
 const MODERN_HOME_CARD_MAX_WIDTH: gpui::Pixels = px(260.0);
 const HOME_CONNECTION_LIST_ACTIONS_WIDTH: gpui::Pixels = px(136.0);
+const HOME_SIDEBAR_EXPANDED_WIDTH: gpui::Pixels = px(220.0);
+const HOME_SIDEBAR_COLLAPSED_WIDTH: gpui::Pixels = px(68.0);
 // HomePage Entity - 管理 home 页面的所有状态
 
 /// 连接列表布局模式
@@ -135,9 +136,11 @@ impl From<ConnectionLayout> for HomeConnectionLayout {
 
 pub struct HomePage {
     focus_handle: FocusHandle,
+    pub(crate) home_active: bool,
     pub(crate) selected_filter: ConnectionType,
     connection_layout: ConnectionLayout,
     home_page_style: HomePageStyle,
+    sidebar_collapsed: bool,
     persistent_sidebar_expanded: bool,
     pub(crate) workspaces: Vec<Workspace>,
     pub(crate) connections: Vec<StoredConnection>,
@@ -173,7 +176,6 @@ pub struct HomePage {
     master_key_unlock_prompt_pending: bool,
     /// 防止主密钥对话框被启动提示和用户点击重复打开。
     master_key_dialog_open: bool,
-    sidebar_collapsed: bool,
     team_permissions: TeamPermissionSnapshot,
     port_forwarding_runtime: Arc<tokio::sync::Mutex<PortForwardingRuntime>>,
     pub(crate) external_driver_registry: IpcDriverRegistry,
@@ -199,6 +201,7 @@ impl ConnectionCredentialExportIdentity {
 }
 
 mod auth;
+mod batch_connection_actions;
 mod cloud_sync;
 mod connection_actions;
 mod connection_badge;
@@ -215,17 +218,21 @@ mod connection_info;
 mod connection_list;
 mod connection_list_actions;
 mod connection_open;
+pub(crate) use connection_open::resolve_connection_credentials;
 mod content;
 mod data;
 mod encryption;
 mod forwarding;
 mod keybindings;
+mod legacy_home;
 mod lifecycle;
 mod local_terminal;
 mod modern_home;
 mod modern_home_shortcuts;
+mod navigation;
 mod render;
 mod sidebar;
+mod sidebar_navigation;
 mod sync_route;
 mod team_permissions;
 mod toolbar;

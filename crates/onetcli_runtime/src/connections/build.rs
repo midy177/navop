@@ -49,6 +49,7 @@ fn build_database(input: &Value) -> Result<StoredConnection, ToolError> {
         sid: optional_value_str(values, "sid").map(str::to_string),
         workspace_id: optional_i64(input, "workspace_id"),
         proxy: None,
+        credential_reference: None,
         extra_params: database_extra_params(values),
     };
     Ok(with_common_fields(
@@ -67,6 +68,11 @@ fn build_ssh(input: &Value) -> Result<StoredConnection, ToolError> {
         auth_method: password.map_or(SshAuthMethod::AutoPublicKey, |password| {
             SshAuthMethod::Password { password }
         }),
+        prompt_username: None,
+        prompt_password: None,
+        keyboard_interactive: None,
+        terminal_encoding: Default::default(),
+        terminal_type: Default::default(),
         connect_timeout: optional_u64(values, "connect_timeout"),
         keepalive_interval: None,
         keepalive_max: None,
@@ -77,8 +83,10 @@ fn build_ssh(input: &Value) -> Result<StoredConnection, ToolError> {
         allow_legacy_algorithms: None,
         jump_server: None,
         proxy: None,
+        credential_reference: None,
         os_id: None,
         icon: None,
+        account_expect: Default::default(),
     };
     Ok(with_common_fields(
         StoredConnection::new_ssh(
@@ -104,6 +112,7 @@ fn build_redis(input: &Value) -> Result<StoredConnection, ToolError> {
         sentinel: None,
         cluster: None,
         ssh_tunnel: None,
+        credential_reference: None,
     };
     Ok(with_common_fields(
         StoredConnection::new_redis(
@@ -147,6 +156,7 @@ fn build_mongodb(input: &Value) -> Result<StoredConnection, ToolError> {
         connect_timeout_seconds: optional_u64(values, "connect_timeout_seconds"),
         application_name: optional_value_str(values, "application_name").map(str::to_string),
         ssh_tunnel: None,
+        credential_reference: None,
     };
     Ok(with_common_fields(
         StoredConnection::new_mongodb(

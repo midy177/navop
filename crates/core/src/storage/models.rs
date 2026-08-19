@@ -1,5 +1,6 @@
 use crate::cloud_sync::sync_type::SyncableItem;
 use crate::crypto;
+use crate::storage::credential_vault::CredentialReference;
 use crate::storage::traits::Entity;
 use connection_tunnel::SshTunnelConfig;
 use gpui::Global;
@@ -9,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fmt;
+
+use super::rdp_settings::RdpSettings;
 
 /// 活跃连接状态 - 用于跟踪哪些连接当前已打开
 #[derive(Default)]
@@ -50,6 +53,7 @@ pub enum ConnectionType {
     Redis,
     MongoDB,
     Serial,
+    Telnet,
     PortForwarding,
     Rdp,
     Vnc,
@@ -64,6 +68,7 @@ impl fmt::Display for ConnectionType {
             ConnectionType::Redis => "Redis",
             ConnectionType::MongoDB => "MongoDB",
             ConnectionType::Serial => "Serial",
+            ConnectionType::Telnet => "Telnet",
             ConnectionType::PortForwarding => "PortForwarding",
             ConnectionType::Rdp => "Rdp",
             ConnectionType::Vnc => "Vnc",
@@ -81,6 +86,7 @@ impl ConnectionType {
             ConnectionType::Redis,
             ConnectionType::MongoDB,
             ConnectionType::Serial,
+            ConnectionType::Telnet,
             ConnectionType::PortForwarding,
             ConnectionType::Rdp,
             ConnectionType::Vnc,
@@ -93,6 +99,7 @@ impl ConnectionType {
             "Redis" => ConnectionType::Redis,
             "MongoDB" => ConnectionType::MongoDB,
             "Serial" => ConnectionType::Serial,
+            "Telnet" => ConnectionType::Telnet,
             "PortForwarding" => ConnectionType::PortForwarding,
             "Rdp" => ConnectionType::Rdp,
             "Vnc" => ConnectionType::Vnc,
@@ -108,6 +115,7 @@ impl ConnectionType {
             ConnectionType::Redis => "Redis",
             ConnectionType::MongoDB => "MongoDB",
             ConnectionType::Serial => "Serial",
+            ConnectionType::Telnet => "Telnet",
             ConnectionType::PortForwarding => "Port Forwarding",
             ConnectionType::Rdp => "RDP",
             ConnectionType::Vnc => "VNC",
@@ -122,6 +130,7 @@ impl ConnectionType {
             ConnectionType::Redis => IconName::Redis,
             ConnectionType::MongoDB => IconName::MongoDB,
             ConnectionType::Serial => IconName::SerialPort,
+            ConnectionType::Telnet => IconName::SquareTerminalColor,
             ConnectionType::PortForwarding => IconName::PortForwardingColor,
             ConnectionType::Rdp => IconName::Rdp,
             ConnectionType::Vnc => IconName::Vnc,
@@ -250,12 +259,139 @@ impl DatabaseType {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredTerminalEncoding {
+    #[default]
+    Utf8,
+    Gbk,
+    Gb18030,
+    Big5,
+    ShiftJis,
+    EucJp,
+    EucKr,
+    Windows1252,
+}
+
+impl StoredTerminalEncoding {
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::Utf8,
+            Self::Gbk,
+            Self::Gb18030,
+            Self::Big5,
+            Self::ShiftJis,
+            Self::EucJp,
+            Self::EucKr,
+            Self::Windows1252,
+        ]
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Gbk => "GBK",
+            Self::Gb18030 => "GB18030",
+            Self::Big5 => "Big5",
+            Self::ShiftJis => "Shift_JIS",
+            Self::EucJp => "EUC-JP",
+            Self::EucKr => "EUC-KR",
+            Self::Windows1252 => "Windows-1252",
+        }
+    }
+
+    fn is_utf8(value: &Self) -> bool {
+        *value == Self::Utf8
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoredTerminalType {
+    #[default]
+    #[serde(rename = "xterm-256color")]
+    Xterm256Color,
+    #[serde(rename = "xterm")]
+    Xterm,
+}
+
+impl StoredTerminalType {
+    pub const fn all() -> &'static [Self] {
+        &[Self::Xterm256Color, Self::Xterm]
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Xterm256Color => "xterm-256color",
+            Self::Xterm => "xterm",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        self.as_str()
+    }
+
+    fn is_default(value: &Self) -> bool {
+        *value == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalExpectSend {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expect: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub send: String,
+}
+
+impl TerminalExpectSend {
+    pub fn is_empty(&self) -> bool {
+        self.expect.is_empty() && self.send.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshAccountExpect {
+    #[serde(default, skip_serializing_if = "TerminalExpectSend::is_empty")]
+    pub username: TerminalExpectSend,
+    #[serde(default, skip_serializing_if = "TerminalExpectSend::is_empty")]
+    pub password: TerminalExpectSend,
+}
+
+impl SshAccountExpect {
+    pub fn is_empty(&self) -> bool {
+        self.username.is_empty() && self.password.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshParams {
     pub host: String,
     pub port: u16,
     pub username: String,
     pub auth_method: SshAuthMethod,
+    /// Optional field-level reference to the local credential vault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<CredentialReference>,
+    /// 不持久化用户名，每次建立连接前由用户输入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_username: Option<bool>,
+    /// 不持久化密码，每次建立连接前由用户输入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_password: Option<bool>,
+    /// 是否允许服务端发起 keyboard-interactive（常用于 OTP/2FA）认证。
+    ///
+    /// 旧连接没有该字段时保持历史行为：允许 keyboard-interactive。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard_interactive: Option<bool>,
+    /// SSH 终端文本编码；旧连接缺少此字段时保持 UTF-8。
+    #[serde(default, skip_serializing_if = "StoredTerminalEncoding::is_utf8")]
+    pub terminal_encoding: StoredTerminalEncoding,
+    /// SSH PTY 终端类型；旧连接缺少此字段时保持 xterm-256color。
+    #[serde(default, skip_serializing_if = "StoredTerminalType::is_default")]
+    pub terminal_type: StoredTerminalType,
+    /// SSH shell/channel 打开后，根据设备 CLI 输出自动应答用户名和密码提示。
+    #[serde(default, skip_serializing_if = "SshAccountExpect::is_empty")]
+    pub account_expect: SshAccountExpect,
     /// 连接超时（秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect_timeout: Option<u64>,
@@ -295,6 +431,30 @@ pub struct SshParams {
 }
 
 impl SshParams {
+    pub fn prompts_for_username(&self) -> bool {
+        self.prompt_username.unwrap_or(false)
+    }
+
+    pub fn prompts_for_password(&self) -> bool {
+        self.prompt_password.unwrap_or(false)
+    }
+
+    pub fn keyboard_interactive_enabled(&self) -> bool {
+        self.keyboard_interactive.unwrap_or(true)
+    }
+
+    /// 清除只应存在于当前连接尝试中的凭据，返回可安全持久化的参数。
+    pub fn sanitize_for_storage(&mut self) {
+        if self.prompts_for_username() {
+            self.username.clear();
+        }
+        if self.prompts_for_password()
+            && let SshAuthMethod::Password { password } = &mut self.auth_method
+        {
+            password.clear();
+        }
+    }
+
     /// 选择连接图标：手动指定优先，其次按探测到的操作系统 ID，未识别时默认 Linux 企鹅。
     pub fn os_icon(&self) -> IconName {
         ssh_os_icon(self.icon.as_deref().or(self.os_id.as_deref()))
@@ -363,6 +523,21 @@ impl RemoteDesktopProtocol {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteDesktopBackendPreference {
+    Auto,
+    WindowsNative,
+    #[default]
+    Canvas,
+}
+
+impl RemoteDesktopBackendPreference {
+    fn is_canvas(value: &Self) -> bool {
+        *value == Self::Canvas
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteDesktopParams {
     pub protocol: RemoteDesktopProtocol,
@@ -370,6 +545,8 @@ pub struct RemoteDesktopParams {
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<CredentialReference>,
     pub domain: Option<String>,
     #[serde(default)]
     pub read_only: bool,
@@ -377,6 +554,21 @@ pub struct RemoteDesktopParams {
     pub audio_playback: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyConfig>,
+    #[serde(
+        default,
+        skip_serializing_if = "RemoteDesktopBackendPreference::is_canvas"
+    )]
+    pub backend_preference: RemoteDesktopBackendPreference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdp: Option<RdpSettings>,
+}
+
+impl RemoteDesktopParams {
+    pub fn effective_rdp_settings(&self) -> RdpSettings {
+        self.rdp
+            .clone()
+            .unwrap_or_else(|| RdpSettings::from_legacy_audio_playback(self.audio_playback))
+    }
 }
 
 /// 跳板机配置
@@ -386,6 +578,8 @@ pub struct JumpServerConfig {
     pub port: u16,
     pub username: String,
     pub auth_method: SshAuthMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<CredentialReference>,
 }
 
 /// 代理类型
@@ -405,6 +599,8 @@ pub struct ProxyConfig {
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<CredentialReference>,
 }
 
 impl fmt::Debug for ProxyConfig {
@@ -416,6 +612,7 @@ impl fmt::Debug for ProxyConfig {
             .field("port", &self.port)
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("credential_reference", &self.credential_reference)
             .finish()
     }
 }
@@ -458,6 +655,8 @@ pub struct RedisSentinelConfig {
     pub sentinels: Vec<String>,
     /// 哨兵密码
     pub sentinel_password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<CredentialReference>,
 }
 
 /// Redis 集群节点
@@ -476,6 +675,8 @@ pub struct RedisParams {
     pub port: u16,
     pub password: Option<String>,
     pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<CredentialReference>,
     pub db_index: u8,
     /// 连接模式
     #[serde(default)]
@@ -611,6 +812,8 @@ pub struct MongoDBParams {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<CredentialReference>,
     #[serde(default)]
     pub auth_source: Option<String>,
     #[serde(default)]
@@ -802,6 +1005,209 @@ impl Default for SerialParams {
     }
 }
 
+/// Telnet 登录脚本步骤：匹配到服务端输出后，自动发送配置的内容。
+///
+/// 对应 Xshell / SecureCRT 的 expect/send 登录脚本模型。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelnetLoginStep {
+    /// 期望匹配的文本；支持 `\r`、`\n`、`\t`、`\xNN` 转义。
+    pub expect: String,
+    /// 匹配后发送的内容；支持与 `expect` 相同的转义，
+    /// 且不以 `\r`/`\n` 结尾时自动补一个回车。
+    #[serde(default)]
+    pub send: String,
+}
+
+/// Telnet 连接参数
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelnetParams {
+    /// 主机地址
+    pub host: String,
+    /// 端口（默认 23）
+    #[serde(default = "default_telnet_port")]
+    pub port: u16,
+    /// Optional field-level reference to the local credential vault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<CredentialReference>,
+    /// 当前设备缺少引用的钥匙串时，仅本次连接提示输入用户名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_username: Option<bool>,
+    /// 当前设备缺少引用的钥匙串时，仅本次连接提示输入密码。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_password: Option<bool>,
+    /// 可选登录脚本；旧连接没有该字段时保持为空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub login_script: Vec<TelnetLoginStep>,
+}
+
+impl TelnetParams {
+    pub fn prompts_for_username(&self) -> bool {
+        self.prompt_username.unwrap_or(false)
+    }
+
+    pub fn prompts_for_password(&self) -> bool {
+        self.prompt_password.unwrap_or(false)
+    }
+
+    /// 返回登录脚本中仍需要由运行时凭据填充的字段。
+    ///
+    /// 只有 `send` 为空且 `expect` 能明确识别为用户名或密码提示时，
+    /// 才会把该字段交给临时凭据输入框，避免把敏感信息发送到不明确的
+    /// 自定义正则步骤中。
+    pub fn login_credential_prompt_fields(&self) -> (bool, bool) {
+        self.login_script
+            .iter()
+            .filter(|step| step.send.is_empty())
+            .filter_map(|step| match telnet_expect_credential_kind(&step.expect) {
+                Some(TelnetExpectCredentialKind::Username) => Some((true, false)),
+                Some(TelnetExpectCredentialKind::Password) => Some((false, true)),
+                None => None,
+            })
+            .fold(
+                (false, false),
+                |(username, password), (step_username, step_password)| {
+                    (username || step_username, password || step_password)
+                },
+            )
+    }
+
+    /// 将临时用户名/密码填入 send 为空的对应 expect 步骤。
+    ///
+    /// 显式配置的 send 始终优先；无法明确识别为用户名或密码提示的步骤保持原样。
+    pub fn apply_login_credentials(&mut self, username: Option<&str>, password: Option<&str>) {
+        for step in &mut self.login_script {
+            if !step.send.is_empty() {
+                continue;
+            }
+            step.send = match telnet_expect_credential_kind(&step.expect) {
+                Some(TelnetExpectCredentialKind::Username) => username
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_default(),
+                Some(TelnetExpectCredentialKind::Password) => password
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_default(),
+                None => "",
+            }
+            .to_string();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelnetExpectCredentialKind {
+    Username,
+    Password,
+}
+
+/// 根据 expect 正则表达式中的提示词判断它需要用户名还是密码。
+///
+/// 这里识别的是正则源码，而真正的服务端输出匹配仍由 Telnet expect 引擎执行。
+/// 同时包含用户名和密码提示词的宽泛规则视为不明确，避免发送错误的敏感信息。
+pub fn telnet_expect_credential_kind(expect: &str) -> Option<TelnetExpectCredentialKind> {
+    let expect = expect.to_ascii_lowercase();
+    let username_markers = ["login", "username", "user name", "account"];
+    let password_markers = ["password", "passwd", "passcode"];
+    let username = username_markers
+        .iter()
+        .any(|marker| contains_telnet_marker(&expect, marker));
+    let password = password_markers
+        .iter()
+        .any(|marker| contains_telnet_marker(&expect, marker));
+    match (username, password) {
+        (true, false)
+            if username_markers
+                .iter()
+                .any(|marker| contains_telnet_prompt_marker(&expect, marker)) =>
+        {
+            Some(TelnetExpectCredentialKind::Username)
+        }
+        (false, true)
+            if password_markers
+                .iter()
+                .any(|marker| contains_telnet_prompt_marker(&expect, marker)) =>
+        {
+            Some(TelnetExpectCredentialKind::Password)
+        }
+        _ => None,
+    }
+}
+
+fn contains_telnet_marker(expect: &str, marker: &str) -> bool {
+    telnet_marker_occurrences(expect, marker).next().is_some()
+}
+
+fn contains_telnet_prompt_marker(expect: &str, marker: &str) -> bool {
+    telnet_marker_occurrences(expect, marker).any(|(_, end)| telnet_prompt_suffix(&expect[end..]))
+}
+
+fn telnet_marker_occurrences<'a>(
+    expect: &'a str,
+    marker: &'a str,
+) -> impl Iterator<Item = (usize, usize)> + 'a {
+    expect.match_indices(marker).filter_map(move |(start, _)| {
+        let end = start + marker.len();
+        let has_word_boundary_before = start == 0
+            || !expect[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_alphanumeric() || character == '_');
+        let has_word_boundary_after = end == expect.len()
+            || !expect[end..]
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_alphanumeric() || character == '_');
+        (has_word_boundary_before && has_word_boundary_after).then_some((start, end))
+    })
+}
+
+fn telnet_prompt_suffix(mut suffix: &str) -> bool {
+    loop {
+        suffix = suffix.trim_start();
+        let Some(first) = suffix.chars().next() else {
+            return true;
+        };
+        if matches!(first, ':' | '>' | '#') {
+            return true;
+        }
+        if first == '$' {
+            return true;
+        }
+        if first == '\\' {
+            let mut indices = suffix.char_indices();
+            indices.next();
+            indices.next();
+            let next_index = indices
+                .next()
+                .map(|(index, _)| index)
+                .unwrap_or(suffix.len());
+            suffix = &suffix[next_index..];
+            continue;
+        }
+        if first.is_ascii_punctuation() {
+            suffix = &suffix[first.len_utf8()..];
+            continue;
+        }
+        return false;
+    }
+}
+
+fn default_telnet_port() -> u16 {
+    23
+}
+
+impl Default for TelnetParams {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 23,
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            login_script: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PortForwardingKind {
     #[default]
@@ -851,6 +1257,8 @@ pub struct DbConnectionConfig {
     pub port: u16,
     pub username: String,
     pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<CredentialReference>,
     pub database: Option<String>,
     pub service_name: Option<String>,
     pub sid: Option<String>,
@@ -1001,6 +1409,9 @@ pub struct Workspace {
     /// 手动排序位序，用于跨设备同步工作区列表顺序。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<i32>,
+    /// 本地侧栏中的折叠状态，不参与云同步。
+    #[serde(skip)]
+    pub sidebar_collapsed: bool,
 }
 
 impl Entity for Workspace {
@@ -1032,6 +1443,7 @@ impl Workspace {
             cloud_id: None,
             last_synced_at: None,
             sort_order: None,
+            sidebar_collapsed: false,
         }
     }
 }
@@ -1236,6 +1648,10 @@ fn default_serial_name(name: String, params: &SerialParams) -> String {
     trimmed_or_default(name, params.port_name.trim().to_string())
 }
 
+fn default_telnet_name(name: String, params: &TelnetParams) -> String {
+    trimmed_or_default(name, host_port_name(&params.host, params.port))
+}
+
 fn default_port_forwarding_name(name: String, params: &PortForwardingParams) -> String {
     let default_name = match params.kind {
         PortForwardingKind::Local => format!(
@@ -1285,7 +1701,8 @@ impl StoredConnection {
         }
     }
 
-    pub fn new_ssh(name: String, params: SshParams, workspace_id: Option<i64>) -> Self {
+    pub fn new_ssh(name: String, mut params: SshParams, workspace_id: Option<i64>) -> Self {
+        params.sanitize_for_storage();
         let name = default_ssh_name(name, &params);
         Self {
             id: None,
@@ -1382,7 +1799,9 @@ impl StoredConnection {
     }
 
     pub fn to_ssh_params(&self) -> Result<SshParams, serde_json::Error> {
-        serde_json::from_str(&self.params)
+        let mut params: SshParams = serde_json::from_str(&self.params)?;
+        params.sanitize_for_storage();
+        Ok(params)
     }
 
     pub fn to_remote_desktop_params(&self) -> Result<RemoteDesktopParams, serde_json::Error> {
@@ -1405,6 +1824,29 @@ impl StoredConnection {
             name,
             connection_type: ConnectionType::Serial,
             params: serde_json::to_string(&params).expect("SerialParams 序列化不应失败"),
+            workspace_id,
+            selected_databases: None,
+            remark: None,
+            sync_enabled: true,
+            cloud_id: None,
+            last_synced_at: None,
+            last_used_at: None,
+            sort_order: None,
+            created_at: None,
+            updated_at: None,
+            team_id: None,
+            owner_id: None,
+        }
+    }
+
+    pub fn new_telnet(name: String, params: TelnetParams, workspace_id: Option<i64>) -> Self {
+        let name = default_telnet_name(name, &params);
+        Self {
+            id: None,
+            credential_revision: None,
+            name,
+            connection_type: ConnectionType::Telnet,
+            params: serde_json::to_string(&params).expect("TelnetParams 序列化不应失败"),
             workspace_id,
             selected_databases: None,
             remark: None,
@@ -1451,6 +1893,10 @@ impl StoredConnection {
         serde_json::from_str(&self.params)
     }
 
+    pub fn to_telnet_params(&self) -> Result<TelnetParams, serde_json::Error> {
+        serde_json::from_str(&self.params)
+    }
+
     pub fn to_port_forwarding_params(&self) -> Result<PortForwardingParams, serde_json::Error> {
         serde_json::from_str(&self.params)
     }
@@ -1483,9 +1929,27 @@ impl StoredConnection {
     }
 
     /// 对 params 中的敏感字段进行加密，返回加密后的 params 字符串。
-    /// 敏感字段包括：password、passphrase、private_key、private_key_content 以及嵌套结构中的同类字段。
+    ///
+    /// 敏感字段包括：password、passphrase、private_key、private_key_content、
+    /// Telnet 登录脚本的 send 值，以及嵌套结构中的同类字段。
     pub fn encrypt_params(&self) -> String {
-        encrypt_json_passwords(&self.params)
+        encrypt_json_passwords(&self.params_for_storage())
+    }
+
+    /// 返回适合持久化、同步、分享或导出的参数 JSON。
+    ///
+    /// SSH 连接若配置为连接时输入用户名或密码，会在此处再次清除对应字段，
+    /// 防止绕过 `StoredConnection::new_ssh` 的调用路径意外泄漏临时凭据。
+    pub fn params_for_storage(&self) -> String {
+        if self.connection_type != ConnectionType::SshSftp {
+            return self.params.clone();
+        }
+
+        let Ok(mut params) = serde_json::from_str::<SshParams>(&self.params) else {
+            return self.params.clone();
+        };
+        params.sanitize_for_storage();
+        serde_json::to_string(&params).unwrap_or_else(|_| self.params.clone())
     }
 
     /// 对 params 中的加密字段进行解密，返回解密后的 params 字符串。
@@ -1514,6 +1978,12 @@ mod tests {
                 port: 2222,
                 username: "deploy".to_string(),
                 auth_method,
+                credential_reference: None,
+                prompt_username: None,
+                prompt_password: None,
+                keyboard_interactive: None,
+                terminal_encoding: Default::default(),
+                terminal_type: Default::default(),
                 connect_timeout: Some(15),
                 keepalive_interval: Some(30),
                 keepalive_max: Some(3),
@@ -1526,6 +1996,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             Some(7),
         );
@@ -1569,6 +2040,7 @@ mod tests {
             workspace_id: Some(7),
             proxy: None,
             extra_params,
+            credential_reference: None,
         }
     }
 
@@ -1600,6 +2072,7 @@ mod tests {
             port: 8080,
             username: Some("alice".to_string()),
             password: Some("secret".to_string()),
+            credential_reference: None,
         });
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1621,6 +2094,7 @@ mod tests {
             port: 1080,
             username: None,
             password: None,
+            credential_reference: None,
         });
 
         assert!(original.is_change(&proxied));
@@ -1636,6 +2110,7 @@ mod tests {
             port: 1080,
             username: Some("alice".to_string()),
             password: Some("secret".to_string()),
+            credential_reference: None,
         });
         ssh.params = serde_json::to_string(&ssh_params).unwrap();
         let mut database = database_config_with_ssh_ref(42);
@@ -1656,6 +2131,7 @@ mod tests {
             port: 8080,
             username: Some("alice".to_string()),
             password: Some("proxy-secret".to_string()),
+            credential_reference: None,
         };
 
         let debug = format!("{proxy:?}");
@@ -1681,6 +2157,7 @@ mod tests {
             workspace_id: None,
             proxy: None,
             extra_params: HashMap::new(),
+            credential_reference: None,
         };
         assert_eq!(
             "127.0.0.1:3306",
@@ -1692,6 +2169,12 @@ mod tests {
             port: 22,
             username: "root".to_string(),
             auth_method: SshAuthMethod::Agent,
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            keyboard_interactive: None,
+            terminal_encoding: Default::default(),
+            terminal_type: Default::default(),
             connect_timeout: None,
             keepalive_interval: None,
             keepalive_max: None,
@@ -1704,6 +2187,7 @@ mod tests {
             proxy: None,
             os_id: None,
             icon: None,
+            account_expect: Default::default(),
         };
         assert_eq!(
             "root@localhost:22",
@@ -1722,6 +2206,7 @@ mod tests {
             sentinel: None,
             cluster: None,
             ssh_tunnel: None,
+            credential_reference: None,
         };
         assert_eq!(
             "10.0.0.5:6379",
@@ -1745,6 +2230,7 @@ mod tests {
             connect_timeout_seconds: None,
             application_name: None,
             ssh_tunnel: None,
+            credential_reference: None,
         };
         assert_eq!(
             "mongo.internal:27017",
@@ -1761,6 +2247,9 @@ mod tests {
             read_only: false,
             audio_playback: false,
             proxy: None,
+            credential_reference: None,
+            backend_preference: RemoteDesktopBackendPreference::Auto,
+            rdp: None,
         };
         assert_eq!(
             "winhost:3389",
@@ -1923,6 +2412,7 @@ mod tests {
                 connection_id: Some(42),
                 ..Default::default()
             }),
+            credential_reference: None,
         };
 
         redis
@@ -1987,6 +2477,7 @@ mod tests {
                 connection_id: Some(42),
                 ..Default::default()
             }),
+            credential_reference: None,
         };
 
         mongo
@@ -2078,6 +2569,8 @@ fn is_sensitive_field(key: &str) -> bool {
         || key == "passphrase"
         || key == "private_key"
         || key == "private_key_content"
+        // Telnet 登录脚本的自动发送内容通常包含密码/enable 密码/token。
+        || key == "send"
         || key.ends_with("_password")
         || key.ends_with("_passphrase")
         || key.ends_with("_private_key")
@@ -2342,6 +2835,9 @@ mod serial_tests {
             read_only: false,
             audio_playback: false,
             proxy: None,
+            credential_reference: None,
+            backend_preference: RemoteDesktopBackendPreference::Canvas,
+            rdp: None,
         };
 
         let conn = StoredConnection::new_remote_desktop("win-rdp".to_string(), params, Some(42));
@@ -2360,6 +2856,7 @@ mod serial_tests {
             serde_json::from_str::<Value>(&conn.params).expect("RDP params parse as JSON");
         assert!(raw_params.get("width").is_none());
         assert!(raw_params.get("height").is_none());
+        assert!(raw_params.get("backend_preference").is_none());
         assert_eq!(RemoteDesktopProtocol::Vnc.default_port(), 5900);
     }
 
@@ -2379,6 +2876,10 @@ mod serial_tests {
 
         assert!(params.proxy.is_none());
         assert!(!params.audio_playback);
+        assert_eq!(
+            RemoteDesktopBackendPreference::Canvas,
+            params.backend_preference
+        );
     }
 
     #[test]
@@ -2403,6 +2904,57 @@ mod serial_tests {
     }
 
     #[test]
+    fn remote_desktop_params_round_trip_preserves_backend_preference() {
+        let json = r#"{
+            "protocol":"Rdp",
+            "host":"10.0.0.8",
+            "port":3389,
+            "username":null,
+            "password":null,
+            "domain":null,
+            "read_only":false,
+            "backend_preference":"windows_native"
+        }"#;
+
+        let params: RemoteDesktopParams = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            RemoteDesktopBackendPreference::WindowsNative,
+            params.backend_preference
+        );
+
+        let restored: RemoteDesktopParams =
+            serde_json::from_str(&serde_json::to_string(&params).unwrap()).unwrap();
+        assert_eq!(
+            RemoteDesktopBackendPreference::WindowsNative,
+            restored.backend_preference
+        );
+    }
+
+    #[test]
+    fn remote_desktop_params_round_trip_preserves_explicit_auto_backend() {
+        let json = r#"{
+            "protocol":"Rdp",
+            "host":"10.0.0.8",
+            "port":3389,
+            "username":null,
+            "password":null,
+            "domain":null,
+            "read_only":false,
+            "backend_preference":"auto"
+        }"#;
+
+        let params: RemoteDesktopParams = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_value(&params).unwrap();
+        assert_eq!(Some("auto"), serialized["backend_preference"].as_str());
+
+        let restored: RemoteDesktopParams = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            RemoteDesktopBackendPreference::Auto,
+            restored.backend_preference
+        );
+    }
+
+    #[test]
     fn remote_desktop_params_round_trip_preserves_proxy() {
         let params = RemoteDesktopParams {
             protocol: RemoteDesktopProtocol::Vnc,
@@ -2419,7 +2971,11 @@ mod serial_tests {
                 port: 1080,
                 username: Some("alice".to_string()),
                 password: Some("proxy-secret".to_string()),
+                credential_reference: None,
             }),
+            credential_reference: None,
+            backend_preference: RemoteDesktopBackendPreference::Auto,
+            rdp: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -2502,6 +3058,12 @@ mod serial_tests {
             port: 22,
             username: "root".to_string(),
             auth_method: SshAuthMethod::Agent,
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            keyboard_interactive: None,
+            terminal_encoding: Default::default(),
+            terminal_type: Default::default(),
             connect_timeout: None,
             keepalive_interval: None,
             keepalive_max: None,
@@ -2514,6 +3076,7 @@ mod serial_tests {
             proxy: None,
             os_id: Some("ubuntu".to_string()),
             icon: None,
+            account_expect: Default::default(),
         };
         let json = serde_json::to_string(&params).expect("SshParams 应可序列化");
         assert!(json.contains("\"os_id\":\"ubuntu\""));
@@ -2532,6 +3095,7 @@ mod serial_tests {
         )
         .expect("旧连接缺少兼容算法字段时应可反序列化");
         assert_eq!(params.allow_legacy_algorithms, None);
+        assert_eq!(params.terminal_encoding, StoredTerminalEncoding::Utf8);
 
         params.allow_legacy_algorithms = Some(true);
         let json = serde_json::to_string(&params).expect("SshParams 应可序列化");
@@ -2539,6 +3103,195 @@ mod serial_tests {
 
         let parsed: SshParams = serde_json::from_str(&json).expect("SshParams 应可反序列化");
         assert_eq!(parsed.allow_legacy_algorithms, Some(true));
+    }
+
+    #[test]
+    fn ssh_account_expect_round_trips_and_legacy_json_defaults_empty() {
+        let params: SshParams = serde_json::from_value(serde_json::json!({
+            "host": "example.com",
+            "port": 22,
+            "username": "root",
+            "auth_method": "Agent",
+            "account_expect": {
+                "username": {
+                    "expect": "(?i)login:",
+                    "send": "admin"
+                },
+                "password": {
+                    "expect": "(?i)password:",
+                    "send": "secret"
+                }
+            }
+        }))
+        .expect("SSH expect 配置应可反序列化");
+
+        let json = serde_json::to_string(&params).expect("SSH expect 配置应可序列化");
+        let parsed: SshParams =
+            serde_json::from_str(&json).expect("SSH expect 配置应可再次反序列化");
+        assert_eq!(parsed.account_expect, params.account_expect);
+        assert!(json.contains("\"account_expect\""));
+
+        let legacy: SshParams = serde_json::from_str(
+            r#"{"host":"example.com","port":22,"username":"root","auth_method":"Agent"}"#,
+        )
+        .expect("旧 SSH 配置应可反序列化");
+        assert!(legacy.account_expect.is_empty());
+        let legacy_json = serde_json::to_string(&legacy).expect("旧 SSH 配置应可序列化");
+        assert!(!legacy_json.contains("account_expect"));
+    }
+
+    #[test]
+    fn ssh_params_credential_prompt_policy_is_backward_compatible() {
+        let mut params: SshParams = serde_json::from_str(
+            r#"{"host":"example.com","port":22,"username":"root","auth_method":{"Password":{"password":"secret"}}}"#,
+        )
+        .expect("旧连接缺少凭据策略字段时应可反序列化");
+        assert!(!params.prompts_for_username());
+        assert!(!params.prompts_for_password());
+        assert!(params.keyboard_interactive_enabled());
+
+        params.prompt_username = Some(true);
+        params.prompt_password = Some(false);
+        params.keyboard_interactive = Some(false);
+        let json = serde_json::to_string(&params).expect("SshParams 应可序列化");
+        assert!(json.contains("\"prompt_username\":true"));
+        assert!(json.contains("\"prompt_password\":false"));
+        assert!(json.contains("\"keyboard_interactive\":false"));
+
+        let parsed: SshParams = serde_json::from_str(&json).expect("SshParams 应可反序列化");
+        assert!(parsed.prompts_for_username());
+        assert!(!parsed.prompts_for_password());
+        assert!(!parsed.keyboard_interactive_enabled());
+    }
+
+    #[test]
+    fn stored_ssh_connection_clears_prompted_credentials() {
+        let params: SshParams = serde_json::from_value(serde_json::json!({
+            "host": "example.com",
+            "port": 22,
+            "username": "temporary-user",
+            "auth_method": {
+                "Password": {
+                    "password": "temporary-password"
+                }
+            },
+            "prompt_username": true,
+            "prompt_password": true,
+            "keyboard_interactive": true
+        }))
+        .expect("测试 SSH 参数应有效");
+
+        let connection = StoredConnection::new_ssh(String::new(), params, None);
+        assert_eq!(connection.name, "example.com:22");
+        assert!(!connection.params.contains("temporary-user"));
+        assert!(!connection.params.contains("temporary-password"));
+
+        let stored = connection.to_ssh_params().expect("持久化参数应可读取");
+        assert!(stored.username.is_empty());
+        assert!(matches!(
+            stored.auth_method,
+            SshAuthMethod::Password { ref password } if password.is_empty()
+        ));
+        assert!(stored.prompts_for_username());
+        assert!(stored.prompts_for_password());
+        assert!(stored.keyboard_interactive_enabled());
+    }
+
+    #[test]
+    fn ssh_storage_boundary_clears_prompted_credentials_from_raw_params() {
+        let mut connection = StoredConnection::new_ssh(
+            "example".to_string(),
+            SshParams {
+                host: "example.com".to_string(),
+                port: 22,
+                username: "stored-user".to_string(),
+                auth_method: SshAuthMethod::Agent,
+                credential_reference: None,
+                prompt_username: None,
+                prompt_password: None,
+                keyboard_interactive: None,
+                terminal_encoding: Default::default(),
+                terminal_type: Default::default(),
+                connect_timeout: None,
+                keepalive_interval: None,
+                keepalive_max: None,
+                default_directory: None,
+                init_script: None,
+                disable_shell_integration: None,
+                x11_forwarding: None,
+                allow_legacy_algorithms: None,
+                jump_server: None,
+                proxy: None,
+                os_id: None,
+                icon: None,
+                account_expect: Default::default(),
+            },
+            None,
+        );
+        connection.params = serde_json::json!({
+            "host": "example.com",
+            "port": 22,
+            "username": "temporary-user",
+            "auth_method": {
+                "Password": {
+                    "password": "temporary-password"
+                }
+            },
+            "prompt_username": true,
+            "prompt_password": true
+        })
+        .to_string();
+
+        let sanitized = connection.params_for_storage();
+        assert!(!sanitized.contains("temporary-user"));
+        assert!(!sanitized.contains("temporary-password"));
+
+        let parsed = connection
+            .to_ssh_params()
+            .expect("读取 SSH 参数时也应清除临时凭据");
+        assert!(parsed.username.is_empty());
+        assert!(matches!(
+            parsed.auth_method,
+            SshAuthMethod::Password { ref password } if password.is_empty()
+        ));
+    }
+
+    #[test]
+    fn ssh_terminal_encoding_round_trips_through_json() {
+        let mut params: SshParams = serde_json::from_str(
+            r#"{"host":"example.com","port":22,"username":"root","auth_method":"Agent"}"#,
+        )
+        .expect("旧连接缺少终端字符集字段时应可反序列化");
+        assert_eq!(params.terminal_encoding, StoredTerminalEncoding::Utf8);
+
+        params.terminal_encoding = StoredTerminalEncoding::EucJp;
+        let json = serde_json::to_string(&params).expect("SshParams 应可序列化");
+        assert!(json.contains("\"terminal_encoding\":\"euc_jp\""));
+
+        let parsed: SshParams = serde_json::from_str(&json).expect("SshParams 应可反序列化");
+        assert_eq!(parsed.terminal_encoding, StoredTerminalEncoding::EucJp);
+        assert!(StoredTerminalEncoding::all().contains(&StoredTerminalEncoding::EucJp));
+        assert_eq!(StoredTerminalEncoding::EucJp.label(), "EUC-JP");
+    }
+
+    #[test]
+    fn ssh_terminal_type_defaults_and_round_trips_through_json() {
+        let mut params: SshParams = serde_json::from_str(
+            r#"{"host":"example.com","port":22,"username":"root","auth_method":"Agent"}"#,
+        )
+        .expect("旧连接缺少终端类型字段时应可反序列化");
+        assert_eq!(params.terminal_type, StoredTerminalType::Xterm256Color);
+
+        let default_json = serde_json::to_string(&params).expect("SshParams 应可序列化");
+        assert!(!default_json.contains("terminal_type"));
+
+        params.terminal_type = StoredTerminalType::Xterm;
+        let json = serde_json::to_string(&params).expect("SshParams 应可序列化");
+        assert!(json.contains("\"terminal_type\":\"xterm\""));
+
+        let parsed: SshParams = serde_json::from_str(&json).expect("SshParams 应可反序列化");
+        assert_eq!(parsed.terminal_type, StoredTerminalType::Xterm);
+        assert_eq!(StoredTerminalType::Xterm.as_str(), "xterm");
     }
 
     #[test]
@@ -2555,5 +3308,207 @@ mod serial_tests {
         params.icon = None;
         params.os_id = None;
         assert!(matches!(params.os_icon(), IconName::LinuxPenguinColor));
+    }
+
+    #[test]
+    fn telnet_params_roundtrip_with_login_script() {
+        let params = TelnetParams {
+            host: "192.168.1.1".to_string(),
+            port: 2323,
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            login_script: vec![
+                TelnetLoginStep {
+                    expect: "login:".to_string(),
+                    send: "admin".to_string(),
+                },
+                TelnetLoginStep {
+                    expect: "Password:".to_string(),
+                    send: "secret".to_string(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&params).expect("TelnetParams 应可序列化");
+        let parsed: TelnetParams = serde_json::from_str(&json).expect("TelnetParams 应可反序列化");
+        assert_eq!(parsed, params);
+    }
+
+    #[test]
+    fn telnet_params_defaults_login_script_for_legacy_json() {
+        let params: TelnetParams = serde_json::from_str(r#"{"host":"10.0.0.1"}"#)
+            .expect("旧 Telnet 连接缺少 login_script 时应可反序列化");
+        assert_eq!(params.host, "10.0.0.1");
+        assert_eq!(params.port, 23);
+        assert!(params.login_script.is_empty());
+
+        let json = serde_json::to_string(&params).expect("TelnetParams 应可序列化");
+        assert!(!json.contains("login_script"));
+    }
+
+    #[test]
+    fn stored_connection_telnet_roundtrip() {
+        let params = TelnetParams {
+            host: "switch.example.com".to_string(),
+            port: 23,
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            login_script: vec![TelnetLoginStep {
+                expect: "Username:".to_string(),
+                send: "admin".to_string(),
+            }],
+        };
+        let conn = StoredConnection::new_telnet(String::new(), params, Some(7));
+        assert_eq!(conn.connection_type, ConnectionType::Telnet);
+        assert_eq!(conn.name, "switch.example.com:23");
+        assert_eq!(conn.workspace_id, Some(7));
+
+        let parsed = conn.to_telnet_params().expect("Telnet 参数应可反序列化");
+        assert_eq!(parsed.host, "switch.example.com");
+        assert_eq!(parsed.port, 23);
+        assert_eq!(parsed.login_script.len(), 1);
+        assert_eq!(parsed.login_script[0].expect, "Username:");
+        assert_eq!(parsed.login_script[0].send, "admin");
+    }
+
+    #[test]
+    fn telnet_params_credential_reference_and_prompt_policy_roundtrip() {
+        let params = TelnetParams {
+            host: "switch.example.com".to_string(),
+            port: 23,
+            credential_reference: Some(CredentialReference {
+                credential_id: 42,
+                credential_cloud_id: Some("credential-cloud-id".to_string()),
+                username: true,
+                password: true,
+                private_key: false,
+                passphrase: false,
+            }),
+            prompt_username: Some(true),
+            prompt_password: Some(true),
+            login_script: Vec::new(),
+        };
+
+        let json = serde_json::to_string(&params).expect("TelnetParams 应可序列化");
+        let parsed: TelnetParams = serde_json::from_str(&json).expect("TelnetParams 应可反序列化");
+        assert_eq!(parsed, params);
+        assert!(parsed.prompts_for_username());
+        assert!(parsed.prompts_for_password());
+    }
+
+    #[test]
+    fn telnet_login_credentials_fill_only_unambiguous_empty_send_steps() {
+        let mut params = TelnetParams {
+            host: "switch.example.com".to_string(),
+            port: 23,
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            login_script: vec![
+                TelnetLoginStep {
+                    expect: r"(?i)(?:login|username)\s*:".to_string(),
+                    send: String::new(),
+                },
+                TelnetLoginStep {
+                    expect: r"(?i)password\s*:".to_string(),
+                    send: String::new(),
+                },
+                TelnetLoginStep {
+                    expect: r"(?i)(?:username|password)\s*:".to_string(),
+                    send: String::new(),
+                },
+                TelnetLoginStep {
+                    expect: "token:".to_string(),
+                    send: "explicit".to_string(),
+                },
+            ],
+        };
+
+        params.apply_login_credentials(Some("admin"), Some("secret"));
+
+        assert_eq!(params.login_script[0].send, "admin");
+        assert_eq!(params.login_script[1].send, "secret");
+        assert!(params.login_script[2].send.is_empty());
+        assert_eq!(params.login_script[3].send, "explicit");
+    }
+
+    #[test]
+    fn telnet_login_credential_prompt_fields_only_include_injectable_empty_steps() {
+        let params = TelnetParams {
+            host: "switch.example.com".to_string(),
+            port: 23,
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            login_script: vec![
+                TelnetLoginStep {
+                    expect: r"(?i)(?:login|username)\s*:".to_string(),
+                    send: String::new(),
+                },
+                TelnetLoginStep {
+                    expect: r"(?i)(?:password|passwd|passcode)\s*:".to_string(),
+                    send: String::new(),
+                },
+                TelnetLoginStep {
+                    expect: r"(?i)(?:username|password)\s*:".to_string(),
+                    send: String::new(),
+                },
+                TelnetLoginStep {
+                    expect: r"(?i)login\s*:".to_string(),
+                    send: "explicit-user".to_string(),
+                },
+                TelnetLoginStep {
+                    expect: "token:".to_string(),
+                    send: String::new(),
+                },
+            ],
+        };
+
+        assert_eq!(params.login_credential_prompt_fields(), (true, true));
+
+        let ambiguous_or_explicit_only = TelnetParams {
+            login_script: params.login_script[2..].to_vec(),
+            ..params
+        };
+        assert_eq!(
+            ambiguous_or_explicit_only.login_credential_prompt_fields(),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn telnet_expect_credential_kind_requires_a_prompt_shaped_expression() {
+        assert_eq!(
+            telnet_expect_credential_kind(r"(?i)(?:login|username)\s*[:>]\s*$"),
+            Some(TelnetExpectCredentialKind::Username)
+        );
+        assert_eq!(
+            telnet_expect_credential_kind(r"(?i)(?:password|passwd)\s*[:>]\s*$"),
+            Some(TelnetExpectCredentialKind::Password)
+        );
+        assert_eq!(telnet_expect_credential_kind(r"(?i)password expired"), None);
+        assert_eq!(
+            telnet_expect_credential_kind(r"(?i)username and password are required"),
+            None
+        );
+        assert_eq!(telnet_expect_credential_kind("not_a_password_prompt"), None);
+    }
+
+    #[test]
+    fn telnet_login_script_send_is_a_sensitive_field() {
+        // encrypt_params/decrypt_params 依赖该字段名识别 Telnet 登录脚本中的
+        // 自动发送凭据；不要退回到只识别 password/passphrase/private_key。
+        assert!(is_sensitive_field("send"));
+        assert!(is_sensitive_field("password"));
+        assert!(is_sensitive_field("passphrase"));
+    }
+
+    #[test]
+    fn connection_type_telnet_methods() {
+        assert_eq!(ConnectionType::Telnet.label(), "Telnet");
+        assert_eq!(ConnectionType::from_str("Telnet"), ConnectionType::Telnet);
+        assert_eq!(format!("{}", ConnectionType::Telnet), "Telnet");
+        assert!(ConnectionType::all().contains(&ConnectionType::Telnet));
     }
 }

@@ -4,15 +4,16 @@ use std::sync::Arc;
 use db::{DbNode, DbNodeType, GlobalDbState};
 use extension_component::DbSelectorKind;
 use gpui::{
-    App, AppContext, AsyncApp, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
-    Render, ScrollHandle, Styled, Subscription, Task, Window, div, prelude::FluentBuilder,
+    App, AppContext, AsyncApp, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled,
+    Subscription, Task, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable, IconName, Sizable,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
-    input::InputState,
+    input::{Input, InputEvent, InputState},
     select::{SearchableVec, SelectEvent, SelectState},
     switch::Switch,
     v_flex,
@@ -21,12 +22,13 @@ use rust_i18n::t;
 use tokio::sync::mpsc;
 
 use crate::compare::sync_statement_picker::{
-    SyncStatementListState, clear_sync_statement_list, default_selected_statement_ids,
-    refresh_sync_statement_list, selected_sync_sql_text_for_ids, sync_statement_list_state,
+    SyncExecutionSnapshot, SyncStatementListState, clear_sync_statement_list,
+    default_selected_statement_ids, refresh_sync_statement_list, selected_sync_execution_snapshot,
+    selected_sync_sql_text_for_ids, sync_statement_list_state,
 };
 use crate::compare::table_picker::{
-    TableSelectionListState, replace_table_selection_list, table_selection_list_state,
-    table_selection_list_tables, table_selection_panel,
+    TableSelectionListState, table_selection_list_state, table_selection_list_tables,
+    table_selection_panel,
 };
 use crate::compare::target_picker::{
     StringSelect, selected_string, set_connection_select, set_string_select, string_select_state,
@@ -69,21 +71,28 @@ pub struct SchemaCompareWindow {
     pub(super) target_database_select: StringSelect,
     pub(super) target_schema: Entity<InputState>,
     pub(super) target_schema_select: StringSelect,
-    pub(super) target_table: Entity<InputState>,
-    pub(super) selected_target_tables: Entity<HashSet<String>>,
-    pub(super) target_table_list: TableSelectionListState,
     pub(super) ignore_identifier_case: Entity<bool>,
+    compare_views: Entity<bool>,
+    compare_routines: Entity<bool>,
+    compare_triggers: Entity<bool>,
     compare_indexes: Entity<bool>,
     compare_foreign_keys: Entity<bool>,
     ignore_comments: Entity<bool>,
     ignore_auto_increment: Entity<bool>,
     ignore_charset_collation: Entity<bool>,
     ignore_table_options: Entity<bool>,
+    compare_column_order: Entity<bool>,
+    type_mapping_overrides: Entity<db::compare::TypeMappingOverrides>,
+    type_mapping_panel_expanded: Entity<bool>,
+    new_override_source_type: Entity<InputState>,
+    new_override_target_type: Entity<InputState>,
+    editing_override_index: Option<usize>,
     pub(super) result: Entity<Option<SchemaCompareResult>>,
     pub(super) sync_plan: Entity<Option<SyncPlan>>,
     pub(super) selected_statement_ids: Entity<HashSet<String>>,
     pub(super) sync_statement_list: SyncStatementListState,
     pub(super) sync_sql_editor: Entity<InputState>,
+    sync_sql_dirty: bool,
     pub(super) execution_log: Entity<Vec<SyncSqlExecutionLogEntry>>,
     pub(super) execution_log_scroll: ScrollHandle,
     continue_on_error: Entity<bool>,
@@ -94,6 +103,7 @@ pub struct SchemaCompareWindow {
     is_running: Entity<bool>,
     is_executing: Entity<bool>,
     compare_task: Option<Task<()>>,
+    compare_generation: u64,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -142,15 +152,27 @@ impl SchemaCompareWindow {
         let target_schema =
             cx.new(|cx| InputState::new(window, cx).default_value(default_schema.clone()));
         let target_schema_select = string_select_state(default_schema.clone(), window, cx);
-        let target_table =
-            cx.new(|cx| InputState::new(window, cx).default_value(default_table.clone()));
         let ignore_identifier_case = cx.new(|_| true);
+        let compare_views = cx.new(|_| false);
+        let compare_routines = cx.new(|_| false);
+        let compare_triggers = cx.new(|_| false);
         let compare_indexes = cx.new(|_| true);
         let compare_foreign_keys = cx.new(|_| true);
         let ignore_comments = cx.new(|_| false);
         let ignore_auto_increment = cx.new(|_| false);
         let ignore_charset_collation = cx.new(|_| false);
         let ignore_table_options = cx.new(|_| false);
+        let compare_column_order = cx.new(|_| false);
+        let type_mapping_overrides = cx.new(|_| db::compare::TypeMappingOverrides::default());
+        let type_mapping_panel_expanded = cx.new(|_| false);
+        let new_override_source_type = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("Compare.source_type_placeholder").to_string())
+        });
+        let new_override_target_type = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("Compare.target_type_placeholder").to_string())
+        });
         let sync_sql_editor = sync_sql_editor_state(window, cx);
         let execution_log_scroll = ScrollHandle::new();
 
@@ -164,12 +186,6 @@ impl SchemaCompareWindow {
             });
             let source_table_list =
                 table_selection_list_state(selected_source_tables.clone(), window, cx);
-            let selected_target_tables = cx.new({
-                let default_selected_tables = default_selected_tables.clone();
-                move |_| default_selected_tables.clone()
-            });
-            let target_table_list =
-                table_selection_list_state(selected_target_tables.clone(), window, cx);
             let mut window_state = Self {
                 source_connection_id,
                 source_connection_select,
@@ -186,16 +202,22 @@ impl SchemaCompareWindow {
                 target_database_select,
                 target_schema,
                 target_schema_select,
-                target_table,
-                selected_target_tables,
-                target_table_list,
                 ignore_identifier_case,
+                compare_views,
+                compare_routines,
+                compare_triggers,
                 compare_indexes,
                 compare_foreign_keys,
                 ignore_comments,
                 ignore_auto_increment,
                 ignore_charset_collation,
                 ignore_table_options,
+                compare_column_order,
+                type_mapping_overrides,
+                type_mapping_panel_expanded,
+                new_override_source_type,
+                new_override_target_type,
+                editing_override_index: None,
                 sync_sql_editor,
                 result: cx.new(|_| None),
                 sync_plan: cx.new(|_| None),
@@ -203,6 +225,7 @@ impl SchemaCompareWindow {
                 sync_statement_list,
                 execution_log: cx.new(|_| Vec::new()),
                 execution_log_scroll,
+                sync_sql_dirty: false,
                 continue_on_error: cx
                     .new(|_| CompareSyncExecutionOptions::default().continue_on_error),
                 progress: cx.new(|_| None),
@@ -212,6 +235,7 @@ impl SchemaCompareWindow {
                 is_running: cx.new(|_| false),
                 is_executing: cx.new(|_| false),
                 compare_task: None,
+                compare_generation: 0,
                 focus_handle: cx.focus_handle(),
                 _subscriptions: Vec::new(),
             };
@@ -220,11 +244,23 @@ impl SchemaCompareWindow {
                 &window_state.selected_statement_ids,
                 window,
                 |this, _, window, cx| {
-                    this.refresh_sync_editor(window, cx);
+                    if !this.sync_sql_dirty {
+                        this.refresh_sync_editor(window, cx);
+                    }
                     this.sync_statement_list.update(cx, |_, cx| cx.notify());
                 },
             );
             window_state._subscriptions.push(sub);
+            window_state._subscriptions.push(cx.subscribe_in(
+                &window_state.sync_sql_editor,
+                window,
+                |this, _, event: &InputEvent, _window, cx| {
+                    if let InputEvent::Change = event {
+                        this.sync_sql_dirty = true;
+                        cx.notify();
+                    }
+                },
+            ));
             // 源级联:连接 → 数据库 → Schema
             window_state._subscriptions.push(cx.subscribe(
                 &window_state.source_connection_select,
@@ -320,15 +356,19 @@ impl SchemaCompareWindow {
                 return;
             }
         };
+        self.compare_generation = self.compare_generation.wrapping_add(1);
+        let compare_generation = self.compare_generation;
         let compare_target = CompareTargetScope::from_schema_params(&params);
         clear_sync_sql_execution_log(&self.execution_log, &self.execution_log_scroll, cx);
         self.clear_compare_preview(window, cx);
         register_connection_for_compare(&params.source_connection_id, cx);
         register_connection_for_compare(&params.target_connection_id, cx);
+        let source_connection_id = params.source_connection_id.clone();
         let target_connection_id = params.target_connection_id.clone();
         let target_database = params.target_database.clone();
         let target_schema = params.target_schema.clone();
         let compare_column_order = params.compare_column_order;
+        let type_mapping_overrides = params.type_mapping_overrides.clone();
         let db_state = Arc::new(cx.global::<GlobalDbState>().clone());
         self.is_running.update(cx, |running, cx| {
             *running = true;
@@ -348,7 +388,11 @@ impl SchemaCompareWindow {
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             while let Some(progress) = progress_rx.recv().await {
                 if this
-                    .update(cx, |view, cx| view.set_progress(Some(progress), cx))
+                    .update(cx, |view, cx| {
+                        if view.compare_generation == compare_generation {
+                            view.set_progress(Some(progress), cx);
+                        }
+                    })
                     .is_err()
                 {
                     break;
@@ -358,47 +402,82 @@ impl SchemaCompareWindow {
         .detach();
 
         let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let result =
-                match execute_schema_compare(params, db_state.clone(), progress_tx, cx).await {
-                    Ok(result) => generate_schema_sync_plan_for_target(
-                        &result,
-                        &db_state,
-                        &target_connection_id,
-                        &target_database,
-                        target_schema.as_deref(),
-                        compare_column_order,
-                    )
-                    .map(|plan| (result, plan)),
-                    Err(error) => Err(error),
-                };
+            let result = execute_schema_compare(params, db_state.clone(), progress_tx, cx).await;
             let _ = this.update(cx, |view, cx| {
+                if view.compare_generation != compare_generation {
+                    return;
+                }
                 view.is_running.update(cx, |running, cx| {
                     *running = false;
                     cx.notify();
                 });
                 view.set_progress(None, cx);
                 match result {
-                    Ok((result, plan)) => {
-                        let selected_ids = default_selected_statement_ids(&plan);
-                        refresh_sync_statement_list(&view.sync_statement_list, &plan, cx);
-                        view.result.update(cx, |slot, cx| {
-                            *slot = Some(result);
-                            cx.notify();
-                        });
-                        view.sync_plan.update(cx, |slot, cx| {
-                            *slot = Some(plan);
-                            cx.notify();
-                        });
-                        view.selected_statement_ids.update(cx, |slot, cx| {
-                            *slot = selected_ids;
-                            cx.notify();
-                        });
-                        view.compare_target.update(cx, |slot, cx| {
-                            *slot = Some(compare_target);
-                            cx.notify();
-                        });
-                        view.current_step = CompareStep::SqlPreview;
-                        view.set_status(t!("Compare.schema_compare_complete").to_string(), cx);
+                    Ok(result) => {
+                        match generate_schema_sync_plan_for_target(
+                            &result,
+                            &db_state,
+                            &source_connection_id,
+                            &target_connection_id,
+                            &target_database,
+                            target_schema.as_deref(),
+                            compare_column_order,
+                            type_mapping_overrides.clone(),
+                        ) {
+                            Ok(plan) => {
+                                let selected_ids = default_selected_statement_ids(&plan);
+                                refresh_sync_statement_list(&view.sync_statement_list, &plan, cx);
+                                view.result.update(cx, |slot, cx| {
+                                    *slot = Some(result);
+                                    cx.notify();
+                                });
+                                view.sync_plan.update(cx, |slot, cx| {
+                                    *slot = Some(plan);
+                                    cx.notify();
+                                });
+                                view.selected_statement_ids.update(cx, |slot, cx| {
+                                    *slot = selected_ids;
+                                    cx.notify();
+                                });
+                                view.compare_target.update(cx, |slot, cx| {
+                                    *slot = Some(compare_target);
+                                    cx.notify();
+                                });
+                                view.current_step = CompareStep::SqlPreview;
+                                view.set_status(
+                                    t!("Compare.schema_compare_complete").to_string(),
+                                    cx,
+                                );
+                            }
+                            Err(error) => {
+                                view.result.update(cx, |slot, cx| {
+                                    *slot = Some(result);
+                                    cx.notify();
+                                });
+                                view.sync_plan.update(cx, |slot, cx| {
+                                    *slot = None;
+                                    cx.notify();
+                                });
+                                view.compare_target.update(cx, |slot, cx| {
+                                    *slot = None;
+                                    cx.notify();
+                                });
+                                view.selected_statement_ids.update(cx, |slot, cx| {
+                                    slot.clear();
+                                    cx.notify();
+                                });
+                                clear_sync_statement_list(&view.sync_statement_list, cx);
+                                view.current_step = CompareStep::SqlPreview;
+                                view.set_status(
+                                    t!(
+                                        "Compare.schema_compare_plan_failed",
+                                        error = error.to_string()
+                                    )
+                                    .to_string(),
+                                    cx,
+                                );
+                            }
+                        }
                     }
                     Err(error) => view.set_status(
                         t!("Compare.compare_failed", error = error.to_string()).to_string(),
@@ -414,12 +493,6 @@ impl SchemaCompareWindow {
     fn swap_source_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let source = self.source_selection(cx);
         let target = self.target_selection(cx);
-        let source_tables = source.tables.clone();
-        let target_tables = target.tables.clone();
-        let source_list_tables = table_selection_list_tables(&self.source_table_list, cx);
-        let target_list_tables = table_selection_list_tables(&self.target_table_list, cx);
-        let source_list_tables = table_items_or_selection(source_list_tables, &source_tables);
-        let target_list_tables = table_items_or_selection(target_list_tables, &target_tables);
 
         set_connection_select(
             &self.source_connection_select,
@@ -463,26 +536,6 @@ impl SchemaCompareWindow {
             window,
             cx,
         );
-        self.source_table.update(cx, |state, cx| {
-            state.set_value(first_table_name(&target_tables), window, cx);
-        });
-        self.target_table.update(cx, |state, cx| {
-            state.set_value(first_table_name(&source_tables), window, cx);
-        });
-        replace_table_selection_list(
-            &self.source_table_list,
-            &self.selected_source_tables,
-            target_list_tables,
-            target_tables.iter().cloned().collect(),
-            cx,
-        );
-        replace_table_selection_list(
-            &self.target_table_list,
-            &self.selected_target_tables,
-            source_list_tables,
-            source_tables.iter().cloned().collect(),
-            cx,
-        );
 
         self.result.update(cx, |slot, cx| {
             *slot = None;
@@ -502,7 +555,8 @@ impl SchemaCompareWindow {
     }
 
     fn cancel_compare(&mut self, cx: &mut Context<Self>) {
-        // 丢弃任务句柄即取消执行器 future,并关闭进度通道
+        // 先使本轮进度/完成回调失效，再丢弃句柄取消执行器 future。
+        self.compare_generation = self.compare_generation.wrapping_add(1);
         self.compare_task = None;
         self.is_running.update(cx, |running, cx| {
             *running = false;
@@ -521,6 +575,13 @@ impl SchemaCompareWindow {
         });
     }
 
+    fn restore_generated_sync_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_sync_editor(window, cx);
+        self.sync_sql_dirty = false;
+        self.set_status(t!("Compare.sync_sql_restored").to_string(), cx);
+        cx.notify();
+    }
+
     fn build_params(&self, cx: &mut Context<Self>) -> Result<SchemaCompareParams, &'static str> {
         schema_compare_params(
             self.source_selection(cx),
@@ -532,20 +593,29 @@ impl SchemaCompareWindow {
     fn schema_compare_settings(&self, cx: &Context<Self>) -> SchemaCompareSettings {
         SchemaCompareSettings {
             case_sensitive_identifiers: !*self.ignore_identifier_case.read(cx),
+            compare_views: *self.compare_views.read(cx),
+            compare_routines: *self.compare_routines.read(cx),
+            compare_triggers: *self.compare_triggers.read(cx),
             compare_indexes: *self.compare_indexes.read(cx),
             compare_foreign_keys: *self.compare_foreign_keys.read(cx),
             ignore_comments: *self.ignore_comments.read(cx),
             ignore_auto_increment: *self.ignore_auto_increment.read(cx),
             ignore_charset_collation: *self.ignore_charset_collation.read(cx),
             ignore_table_options: *self.ignore_table_options.read(cx),
-            compare_column_order: false,
+            compare_column_order: *self.compare_column_order.read(cx),
+            type_mapping_overrides: self.type_mapping_overrides.read(cx).clone(),
         }
     }
 
     fn start_execute_sync_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(status) = self.sync_sql_blocked_status(cx) {
+            self.set_status(status, cx);
+            return;
+        }
         start_sync_sql_execution(
             self.compare_target.read(cx).clone(),
-            self.editor_sql(cx),
+            self.sync_plan.clone(),
+            self.sync_execution_snapshot(cx),
             self.sync_execution_options(cx),
             self.status.clone(),
             self.is_executing.clone(),
@@ -574,7 +644,12 @@ impl SchemaCompareWindow {
 
     fn go_execute_step(&mut self, cx: &mut Context<Self>) {
         if self.current_step == CompareStep::SqlPreview {
-            let entries = sync_sql_execution_start_log_entries(&self.editor_sql(cx));
+            if let Some(status) = self.sync_sql_blocked_status(cx) {
+                self.set_status(status, cx);
+                return;
+            }
+            let snapshot = self.sync_execution_snapshot(cx);
+            let entries = sync_sql_execution_start_log_entries(&snapshot.sql);
             if let Some(entry) = entries.first() {
                 self.set_status(entry.message.clone(), cx);
             }
@@ -589,7 +664,7 @@ impl SchemaCompareWindow {
         }
     }
 
-    /// 编辑器中实际待执行的 SQL(用户可能已手动修改)
+    /// SQL preview editor content. Execution uses the immutable plan snapshot instead.
     fn editor_sql(&self, cx: &Context<Self>) -> String {
         self.sync_sql_editor.read(cx).text().to_string()
     }
@@ -603,6 +678,18 @@ impl SchemaCompareWindow {
             .map_or_else(String::new, |plan| {
                 selected_sync_sql_text_for_ids(plan, selected_ids)
             })
+    }
+
+    fn sync_execution_snapshot(&self, cx: &Context<Self>) -> SyncExecutionSnapshot {
+        let selected_ids = self.selected_statement_ids.read(cx);
+        self.sync_plan.read(cx).as_ref().map_or_else(
+            || SyncExecutionSnapshot {
+                plan_id: String::new(),
+                statements: Vec::new(),
+                sql: String::new(),
+            },
+            |plan| selected_sync_execution_snapshot(plan, selected_ids),
+        )
     }
 
     fn has_editor_sql(&self, cx: &Context<Self>) -> bool {
@@ -630,10 +717,27 @@ impl SchemaCompareWindow {
         self.sync_sql_editor.update(cx, |state, cx| {
             state.set_value(String::new(), window, cx);
         });
+        self.sync_sql_dirty = false;
     }
 
     fn sync_execution_options(&self, cx: &Context<Self>) -> CompareSyncExecutionOptions {
         CompareSyncExecutionOptions::schema_ddl(*self.continue_on_error.read(cx))
+    }
+
+    fn sync_sql_blocked(&self, cx: &Context<Self>) -> bool {
+        self.sync_sql_dirty
+            || self.compare_target.read(cx).is_none()
+            || self.sync_plan.read(cx).is_none()
+    }
+
+    fn sync_sql_blocked_status(&self, cx: &Context<Self>) -> Option<String> {
+        if self.sync_sql_dirty {
+            Some(t!("Compare.sync_sql_restore_before_execute").to_string())
+        } else if self.compare_target.read(cx).is_none() || self.sync_plan.read(cx).is_none() {
+            Some(t!("Compare.sync_sql_compare_first").to_string())
+        } else {
+            None
+        }
     }
 
     fn set_progress(&self, progress: Option<CompareProgress>, cx: &mut Context<Self>) {
@@ -709,24 +813,24 @@ impl SchemaCompareWindow {
                                 "schema-object-views",
                                 t!("Compare.object_views").to_string(),
                                 false,
-                                true,
-                                None,
+                                false,
+                                Some(self.compare_views.clone()),
                                 cx,
                             ))
                             .child(schema_object_type_option(
                                 "schema-object-routines",
                                 t!("Compare.object_routines").to_string(),
                                 false,
-                                true,
-                                None,
+                                false,
+                                Some(self.compare_routines.clone()),
                                 cx,
                             ))
                             .child(schema_object_type_option(
                                 "schema-object-triggers",
                                 t!("Compare.object_triggers").to_string(),
                                 false,
-                                true,
-                                None,
+                                false,
+                                Some(self.compare_triggers.clone()),
                                 cx,
                             )),
                     ),
@@ -763,9 +867,283 @@ impl SchemaCompareWindow {
                                 self.ignore_comments.clone(),
                                 t!("Compare.ignore_comments").to_string(),
                                 cx,
+                            ))
+                            .child(compare_rule_switch(
+                                "schema-sync-column-order",
+                                self.compare_column_order.clone(),
+                                t!("Compare.sync_column_order").to_string(),
+                                cx,
                             )),
                     ),
             )
+    }
+
+    pub(super) fn render_type_mapping_overrides(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let expanded = *self.type_mapping_panel_expanded.read(cx);
+        let overrides = self.type_mapping_overrides.read(cx);
+        let editing_index = self.editing_override_index;
+        let target_database = self.selected_target_database_storage_key(cx);
+
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("toggle-type-mapping-panel")
+                            .icon(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.type_mapping_panel_expanded.update(cx, |expanded, cx| {
+                                    *expanded = !*expanded;
+                                    cx.notify();
+                                });
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(t!("Compare.type_mapping_overrides").to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("({})", overrides.overrides.len())),
+                    ),
+            )
+            .when(expanded, |this| {
+                let mut rows = v_flex().gap_1();
+
+                for (index, entry) in overrides.overrides.iter().enumerate() {
+                    let idx = index;
+                    let is_editing = editing_index == Some(index);
+                    let source_type = entry.source_type.clone();
+                    let target_database = entry.target_database.clone();
+                    let target_type = entry.target_type.clone();
+                    let enabled = entry.enabled;
+                    let is_active = enabled;
+
+                    rows = rows.child(
+                        h_flex()
+                            .id(("type-mapping-override", idx))
+                            .gap_2()
+                            .items_center()
+                            .rounded_sm()
+                            .px_1()
+                            .when(is_editing, |this| this.bg(cx.theme().accent))
+                            .when(!is_editing, |this| {
+                                this.hover(|style| style.bg(cx.theme().accent))
+                            })
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                let entry = view
+                                    .type_mapping_overrides
+                                    .read(cx)
+                                    .overrides
+                                    .get(idx)
+                                    .cloned();
+                                if let Some(entry) = entry {
+                                    view.new_override_source_type.update(cx, |input, cx| {
+                                        input.set_value(entry.source_type.clone(), window, cx);
+                                    });
+                                    view.new_override_target_type.update(cx, |input, cx| {
+                                        input.set_value(entry.target_type.clone(), window, cx);
+                                    });
+                                    view.editing_override_index = Some(idx);
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .when(!is_active, |this| {
+                                        this.text_color(cx.theme().muted_foreground)
+                                    })
+                                    .child(source_type),
+                            )
+                            .child(
+                                div()
+                                    .w(px(72.0))
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(target_database),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .when(!is_active, |this| {
+                                        this.text_color(cx.theme().muted_foreground)
+                                    })
+                                    .child(target_type),
+                            )
+                            .child(
+                                Checkbox::new(("override-enabled", idx))
+                                    .checked(enabled)
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.type_mapping_overrides.update(cx, |overrides, cx| {
+                                            if let Some(entry) = overrides.overrides.get_mut(idx) {
+                                                entry.enabled = !entry.enabled;
+                                            }
+                                            cx.notify();
+                                        });
+                                    })),
+                            )
+                            .child(
+                                Button::new(("remove-override", idx))
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::Delete)
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.type_mapping_overrides.update(cx, |overrides, cx| {
+                                            if idx < overrides.overrides.len() {
+                                                overrides.overrides.remove(idx);
+                                            }
+                                            cx.notify();
+                                        });
+                                        if view.editing_override_index == Some(idx) {
+                                            view.editing_override_index = None;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
+                }
+
+                rows =
+                    rows.child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .pt_1()
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    Input::new(&self.new_override_source_type).small().w_full(),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(72.0))
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .px_1()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .truncate()
+                                    .child(target_database),
+                            )
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    Input::new(&self.new_override_target_type).small().w_full(),
+                                ),
+                            )
+                            .child(
+                                Button::new("add-type-mapping-override")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::Plus)
+                                    .tooltip(t!("Compare.add_type_mapping").to_string())
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.upsert_type_mapping_override(window, cx);
+                                    })),
+                            )
+                            .when_some(editing_index, |this, _| {
+                                this.child(
+                                    Button::new("cancel-edit-type-mapping-override")
+                                        .small()
+                                        .ghost()
+                                        .child(t!("Common.cancel").to_string())
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            view.reset_type_mapping_form(window, cx);
+                                        })),
+                                )
+                            }),
+                    );
+
+                this.child(rows)
+            })
+    }
+
+    fn selected_target_database_storage_key(&self, cx: &App) -> String {
+        let connection_id = selected_connection_id(
+            &self.target_connection_select,
+            &self.target_connection_id,
+            cx,
+        );
+        cx.try_global::<GlobalDbState>()
+            .and_then(|state| state.get_config(&connection_id))
+            .map(|config| config.database_type.storage_key())
+            .unwrap_or_else(|| t!("Compare.target_database_placeholder").to_string())
+    }
+
+    fn upsert_type_mapping_override(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let source_type = self
+            .new_override_source_type
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let target_type = self
+            .new_override_target_type
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if source_type.is_empty() || target_type.is_empty() {
+            self.set_status(t!("Compare.type_mapping_required_fields").to_string(), cx);
+            return;
+        }
+
+        let target_database = self.selected_target_database_storage_key(cx);
+        let editing_idx = self.editing_override_index;
+        let enabled = editing_idx
+            .and_then(|idx| self.type_mapping_overrides.read(cx).overrides.get(idx))
+            .map(|entry| entry.enabled)
+            .unwrap_or(true);
+        let entry = db::compare::TypeMappingOverride {
+            source_type,
+            target_database,
+            target_type,
+            enabled,
+            note: None,
+        };
+        self.type_mapping_overrides.update(cx, |overrides, cx| {
+            if let Some(idx) = editing_idx {
+                if idx < overrides.overrides.len() {
+                    overrides.overrides.remove(idx);
+                }
+            }
+            overrides.upsert(entry);
+            cx.notify();
+        });
+        self.reset_type_mapping_form(window, cx);
+        self.set_status(t!("Compare.type_mapping_saved").to_string(), cx);
+    }
+
+    fn reset_type_mapping_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_override_source_type.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.new_override_target_type.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.editing_override_index = None;
+        cx.notify();
     }
 
     fn source_selection(&self, cx: &Context<Self>) -> SchemaCompareSelection {
@@ -808,11 +1186,10 @@ impl SchemaCompareWindow {
             ),
             database,
             schema,
-            tables: selected_schema_table_names(
-                &self.target_table_list,
-                &self.selected_target_tables,
-                cx,
-            ),
+            // Schema comparison uses the source-side table selection as the
+            // canonical object-name set. The target side always matches those
+            // names in its selected database/schema.
+            tables: Vec::new(),
         }
     }
 }
@@ -836,18 +1213,6 @@ fn selected_schema_table_names<T>(
     let mut selected = selected.iter().cloned().collect::<Vec<_>>();
     selected.sort();
     selected
-}
-
-fn first_table_name(tables: &[String]) -> String {
-    tables.first().cloned().unwrap_or_default()
-}
-
-fn table_items_or_selection(items: Vec<String>, selected: &[String]) -> Vec<String> {
-    if items.is_empty() {
-        selected.to_vec()
-    } else {
-        items
-    }
 }
 
 fn schema_object_type_option<T: 'static>(
@@ -928,7 +1293,11 @@ impl Render for SchemaCompareWindow {
         let is_running = *self.is_running.read(cx);
         let is_executing = *self.is_executing.read(cx);
         let has_sync_sql = self.has_editor_sql(cx);
-        let status = if self.current_step == CompareStep::SqlExecute {
+        let sync_sql_dirty = self.sync_sql_dirty;
+        let sync_sql_blocked = self.sync_sql_blocked(cx);
+        let status = if sync_sql_dirty && self.current_step == CompareStep::SqlPreview {
+            t!("Compare.sync_sql_modified").to_string()
+        } else if self.current_step == CompareStep::SqlExecute {
             String::new()
         } else {
             self.status.read(cx).clone()
@@ -1002,15 +1371,36 @@ impl Render for SchemaCompareWindow {
                                     div()
                                         .flex_1()
                                         .h_full()
+                                        .min_w_0()
                                         .min_h_0()
+                                        .overflow_hidden()
                                         .child(self.render_result_meta(cx)),
                                 )
-                                .child(div().flex_1().h_full().min_h_0().child(sql_editor_panel(
-                                    "schema-compare-copy-sql",
-                                    &self.sync_sql_editor,
-                                    editor_sql,
-                                    cx,
-                                ))),
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h_full()
+                                        .min_h_0()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .h(px(240.0))
+                                                .min_h(px(160.0))
+                                                .min_w_0()
+                                                .flex_none()
+                                                .overflow_hidden()
+                                                .child(self.render_sync_statement_picker(cx)),
+                                        )
+                                        .child(div().flex_1().min_w_0().min_h_0().child(
+                                            sql_editor_panel(
+                                                "schema-compare-copy-sql",
+                                                &self.sync_sql_editor,
+                                                editor_sql,
+                                                cx,
+                                            ),
+                                        )),
+                                ),
                         )
                     })
                     .when(self.current_step == CompareStep::SqlExecute, |this| {
@@ -1093,9 +1483,23 @@ impl Render for SchemaCompareWindow {
                                             view.start_compare(window, cx);
                                         })),
                                 )
+                                .when(sync_sql_dirty, |this| {
+                                    this.child(
+                                        Button::new("restore-generated-sync-sql")
+                                            .child(t!("Compare.restore_generated_sql").to_string())
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                view.restore_generated_sync_sql(window, cx);
+                                            })),
+                                    )
+                                })
                                 .child(
                                     Button::new("compare-preview-next")
-                                        .disabled(is_running || is_executing || !has_sync_sql)
+                                        .disabled(
+                                            is_running
+                                                || is_executing
+                                                || sync_sql_blocked
+                                                || !has_sync_sql,
+                                        )
                                         .child(t!("Common.next").to_string())
                                         .on_click(cx.listener(move |view, _, _, cx| {
                                             view.go_execute_step(cx);
@@ -1116,7 +1520,12 @@ impl Render for SchemaCompareWindow {
                                         .primary()
                                         .child(t!("Compare.execute_sql").to_string())
                                         .loading(is_executing)
-                                        .disabled(is_running || is_executing || !has_sync_sql)
+                                        .disabled(
+                                            is_running
+                                                || is_executing
+                                                || sync_sql_blocked
+                                                || !has_sync_sql,
+                                        )
                                         .on_click(cx.listener(move |view, _, window, cx| {
                                             view.start_execute_sync_sql(window, cx);
                                         })),
